@@ -9,6 +9,7 @@ declare global {
 			closeTerminal: (id: string) => Promise<void>;
 			pickWorkspaceDirectory: () => Promise<WorkspaceSelection | null>;
 			inspectWorkspace: (directoryPath: string) => Promise<WorkspaceSelection>;
+			updateTitleBarOverlay: (payload: { backgroundColor: string; overlayColor: string; symbolColor: string }) => Promise<void>;
 			subscribeTerminal: (
 				id: string,
 				handlers: {

@@ -49,277 +49,377 @@ export interface MosaicTheme {
 	};
 }
 
-export const themes: Record<string, MosaicTheme> = {
-	jade: {
-		id: "jade",
-		name: "Jade Terminal",
+function clamp(value: number, min: number, max: number) {
+	return Math.min(max, Math.max(min, value));
+}
+
+function hexToRgb(color: string) {
+	const value = color.trim().replace("#", "");
+	if (value.length !== 3 && value.length !== 6) return null;
+	const normalized = value.length === 3 ? value.split("").map((part) => `${part}${part}`).join("") : value;
+	const int = Number.parseInt(normalized, 16);
+	if (Number.isNaN(int)) return null;
+	return {
+		r: (int >> 16) & 255,
+		g: (int >> 8) & 255,
+		b: int & 255,
+	};
+}
+
+function rgbToHex(r: number, g: number, b: number) {
+	const toHex = (value: number) => value.toString(16).padStart(2, "0");
+	return `#${toHex(clamp(Math.round(r), 0, 255))}${toHex(clamp(Math.round(g), 0, 255))}${toHex(clamp(Math.round(b), 0, 255))}`;
+}
+
+function blendHex(base: string, target: string, ratio: number) {
+	const left = hexToRgb(base);
+	const right = hexToRgb(target);
+	if (!left || !right) return base;
+	const t = clamp(ratio, 0, 1);
+	return rgbToHex(
+		left.r + (right.r - left.r) * t,
+		left.g + (right.g - left.g) * t,
+		left.b + (right.b - left.b) * t,
+	);
+}
+
+function relativeLuminance(color: string) {
+	const rgb = hexToRgb(color);
+	if (!rgb) return 0;
+	const channel = (value: number) => {
+		const srgb = value / 255;
+		return srgb <= 0.03928 ? srgb / 12.92 : ((srgb + 0.055) / 1.055) ** 2.4;
+	};
+	return 0.2126 * channel(rgb.r) + 0.7152 * channel(rgb.g) + 0.0722 * channel(rgb.b);
+}
+
+function contrastRatio(a: string, b: string) {
+	const first = relativeLuminance(a);
+	const second = relativeLuminance(b);
+	const light = Math.max(first, second);
+	const dark = Math.min(first, second);
+	return (light + 0.05) / (dark + 0.05);
+}
+
+function enforceThemeConstraints(themeMap: Record<string, MosaicTheme>) {
+	const normalized: Record<string, MosaicTheme> = {};
+	const dominantAccentRegistry = new Map<string, string>();
+
+	for (const [id, theme] of Object.entries(themeMap)) {
+		const nextTheme: MosaicTheme = {
+			...theme,
+			bgWell: theme.bgSurface,
+			terminal: {
+				...theme.terminal,
+			},
+		};
+
+		if (contrastRatio(nextTheme.textPrimary, nextTheme.bgSurface) < 4.8) {
+			nextTheme.textPrimary = nextTheme.kind === "light"
+				? blendHex(nextTheme.textPrimary, "#050505", 0.28)
+				: blendHex(nextTheme.textPrimary, "#f6f6f9", 0.22);
+		}
+		if (contrastRatio(nextTheme.textSecondary, nextTheme.bgSurface) < 3.0) {
+			nextTheme.textSecondary = nextTheme.kind === "light"
+				? blendHex(nextTheme.textSecondary, "#111111", 0.18)
+				: blendHex(nextTheme.textSecondary, "#d0d0d6", 0.22);
+		}
+		if (contrastRatio(nextTheme.terminal.foreground, nextTheme.bgWell) < 4.5) {
+			nextTheme.terminal.foreground = nextTheme.textPrimary;
+		}
+		if (contrastRatio(nextTheme.terminal.cursor, nextTheme.bgWell) < 3.0) {
+			nextTheme.terminal.cursor = nextTheme.accents.product;
+		}
+
+		if (nextTheme.kind === "dark" && nextTheme.bgVoid.toLowerCase() === "#000000") {
+			nextTheme.bgVoid = blendHex(nextTheme.bgSurface, "#020205", 0.72);
+		}
+
+		const dominantAccent = nextTheme.accents.product.toLowerCase();
+		const existingTheme = dominantAccentRegistry.get(dominantAccent);
+		if (existingTheme) {
+			throw new Error(`Theme accent collision: ${id} duplicates ${existingTheme} dominant accent ${nextTheme.accents.product}`);
+		}
+		dominantAccentRegistry.set(dominantAccent, id);
+		normalized[id] = nextTheme;
+	}
+
+	return normalized;
+}
+
+const baseThemes: Record<string, MosaicTheme> = {
+	midnight: {
+		id: "midnight",
+		name: "Midnight",
 		kind: "dark",
 
-		bgVoid: "#0a100e",
-		bgSurface: "#111d18",
-		bgWell: "#0a120f",
+		bgVoid: "#0a0a0a",
+		bgSurface: "#111111",
+		bgWell: "#141414",
 
-		borderDim: "#1a2a24",
-		borderGlow: "#2a3a34",
+		borderDim: "rgba(255, 255, 255, 0.06)",
+		borderGlow: "rgba(255, 255, 255, 0.12)",
 
-		textPrimary: "#c0d4c8",
-		textSecondary: "#5a7a6a",
-		textMuted: "#2e4a3a",
+		textPrimary: "#ededed",
+		textSecondary: "#888888",
+		textMuted: "#555555",
 
-		statusSuccess: "#34d399",
-		statusWarn: "#e8a634",
-		statusError: "#e85454",
+		statusSuccess: "#3ddc97",
+		statusWarn: "#f0b35a",
+		statusError: "#ef4444",
 
 		accents: {
-			product: "#34d399",
-			engineering: "#4a9e8a",
-			research: "#8abeb7",
-			ops: "#e8a634",
+			product: "#7aa2ff",
+			engineering: "#73d4ff",
+			research: "#b28cff",
+			ops: "#f0b35a",
 		},
 
 		terminal: {
-			foreground: "#b0c8b8",
-			cursor: "#34d399",
-			cursorAccent: "#0a120f",
-			selectionBackground: "#ffffff12",
-			black: "#0a100e",
-			brightBlack: "#3a5a4a",
-			red: "#e85454",
-			green: "#34d399",
-			yellow: "#e8a634",
-			blue: "#5a9abf",
-			magenta: "#9b7acc",
-			cyan: "#4a9e8a",
-			white: "#c0d4c8",
-			brightWhite: "#e0f0e8",
+			foreground: "#d4d4d4",
+			cursor: "#ededed",
+			cursorAccent: "#141414",
+			selectionBackground: "rgba(255, 255, 255, 0.08)",
+			black: "#0a0a0a",
+			brightBlack: "#555555",
+			red: "#ef4444",
+			green: "#3ddc97",
+			yellow: "#f0b35a",
+			blue: "#7aa2ff",
+			magenta: "#b28cff",
+			cyan: "#73d4ff",
+			white: "#d4d4d4",
+			brightWhite: "#fafafa",
 		},
 	},
 
-	deepsea: {
-		id: "deepsea",
-		name: "Deep Sea",
+
+	ember: {
+		id: "ember",
+		name: "Ember",
 		kind: "dark",
 
-		bgVoid: "#0a0f1a",
-		bgSurface: "#0e1628",
-		bgWell: "#080e1a",
+		bgVoid: "#0e0804",
+		bgSurface: "#161009",
+		bgWell: "#161009",
 
-		borderDim: "#15213a",
-		borderGlow: "#1e3050",
+		borderDim: "rgba(214, 156, 78, 0.10)",
+		borderGlow: "rgba(214, 156, 78, 0.22)",
 
-		textPrimary: "#b8c8d8",
-		textSecondary: "#5a7a9a",
-		textMuted: "#2a3a5a",
+		textPrimary: "#f0dcc0",
+		textSecondary: "#9a7e5e",
+		textMuted: "#5a4430",
 
-		statusSuccess: "#34d399",
-		statusWarn: "#f0c674",
-		statusError: "#f87171",
+		statusSuccess: "#b5d07a",
+		statusWarn: "#e8a735",
+		statusError: "#d44830",
 
 		accents: {
-			product: "#22d3ee",
-			engineering: "#3b82f6",
-			research: "#818cf8",
-			ops: "#f0c674",
+			product: "#e8a735",
+			engineering: "#d07a4a",
+			research: "#c97ab0",
+			ops: "#b5d07a",
 		},
 
 		terminal: {
-			foreground: "#a0b8cc",
-			cursor: "#22d3ee",
-			cursorAccent: "#080e1a",
-			selectionBackground: "#ffffff10",
-			black: "#0a0f1a",
-			brightBlack: "#2a3a5a",
-			red: "#f87171",
-			green: "#34d399",
-			yellow: "#f0c674",
-			blue: "#3b82f6",
-			magenta: "#818cf8",
-			cyan: "#22d3ee",
-			white: "#b8c8d8",
-			brightWhite: "#dce8f0",
+			foreground: "#e0cbb0",
+			cursor: "#e8a735",
+			cursorAccent: "#161009",
+			selectionBackground: "rgba(232, 167, 53, 0.12)",
+			black: "#0e0804",
+			brightBlack: "#5a4430",
+			red: "#d44830",
+			green: "#b5d07a",
+			yellow: "#e8a735",
+			blue: "#6a9ec0",
+			magenta: "#c97ab0",
+			cyan: "#7abcb0",
+			white: "#e0cbb0",
+			brightWhite: "#f5ead8",
 		},
 	},
 
-	nordic: {
-		id: "nordic",
-		name: "Nordic Frost",
+	oxide: {
+		id: "oxide",
+		name: "Oxide",
 		kind: "dark",
 
-		bgVoid: "#0f1923",
-		bgSurface: "#141f2b",
-		bgWell: "#0c1520",
+		bgVoid: "#08090c",
+		bgSurface: "#0e1017",
+		bgWell: "#0e1017",
 
-		borderDim: "#1e2d3d",
-		borderGlow: "#2a3d50",
+		borderDim: "rgba(100, 140, 200, 0.08)",
+		borderGlow: "rgba(100, 140, 200, 0.18)",
 
-		textPrimary: "#c8d4de",
-		textSecondary: "#6a8a9a",
-		textMuted: "#2e4050",
+		textPrimary: "#c4cede",
+		textSecondary: "#5e6e84",
+		textMuted: "#333d4e",
 
-		statusSuccess: "#a3be8c",
-		statusWarn: "#ebcb8b",
-		statusError: "#bf616a",
+		statusSuccess: "#58c48a",
+		statusWarn: "#d4a64e",
+		statusError: "#c4484a",
 
 		accents: {
-			product: "#88c0d0",
-			engineering: "#a3be8c",
-			research: "#b48ead",
-			ops: "#d08770",
+			product: "#4a90d4",
+			engineering: "#58c48a",
+			research: "#8a6cd4",
+			ops: "#d4a64e",
 		},
 
 		terminal: {
-			foreground: "#b0bec8",
-			cursor: "#88c0d0",
-			cursorAccent: "#0c1520",
-			selectionBackground: "#ffffff10",
-			black: "#0f1923",
-			brightBlack: "#3b4b5b",
-			red: "#bf616a",
-			green: "#a3be8c",
-			yellow: "#ebcb8b",
-			blue: "#5e81ac",
-			magenta: "#b48ead",
-			cyan: "#88c0d0",
-			white: "#c8d4de",
-			brightWhite: "#e5eaf0",
+			foreground: "#b4c0d0",
+			cursor: "#4a90d4",
+			cursorAccent: "#0e1017",
+			selectionBackground: "rgba(74, 144, 212, 0.12)",
+			black: "#08090c",
+			brightBlack: "#3a4558",
+			red: "#c4484a",
+			green: "#58c48a",
+			yellow: "#d4a64e",
+			blue: "#4a90d4",
+			magenta: "#8a6cd4",
+			cyan: "#4ab0c0",
+			white: "#b4c0d0",
+			brightWhite: "#dce4ee",
 		},
 	},
 
-	dusk: {
-		id: "dusk",
-		name: "Dusk",
-		kind: "dark",
-
-		bgVoid: "#13111a",
-		bgSurface: "#1a1624",
-		bgWell: "#100e18",
-
-		borderDim: "#2a2235",
-		borderGlow: "#3a2a48",
-
-		textPrimary: "#c8c0d4",
-		textSecondary: "#8a7a9a",
-		textMuted: "#3a2a4a",
-
-		statusSuccess: "#a0e8c4",
-		statusWarn: "#e8c880",
-		statusError: "#e87a7a",
-
-		accents: {
-			product: "#e8a0c0",
-			engineering: "#c4a0e8",
-			research: "#a0b8e8",
-			ops: "#e8c880",
-		},
-
-		terminal: {
-			foreground: "#b8b0c8",
-			cursor: "#c4a0e8",
-			cursorAccent: "#100e18",
-			selectionBackground: "#ffffff10",
-			black: "#13111a",
-			brightBlack: "#3a2a4a",
-			red: "#e87a7a",
-			green: "#a0e8c4",
-			yellow: "#e8c880",
-			blue: "#a0b8e8",
-			magenta: "#c4a0e8",
-			cyan: "#88c8d8",
-			white: "#c8c0d4",
-			brightWhite: "#e8e0f0",
-		},
-	},
-
-	brutalist: {
-		id: "brutalist",
-		name: "Brutalist Dark",
-		kind: "dark",
-
-		bgVoid: "#050505",
-		bgSurface: "#0f0f0f",
-		bgWell: "#090909",
-
-		borderDim: "#2c2c2c",
-		borderGlow: "#505050",
-
-		textPrimary: "#f0f0f0",
-		textSecondary: "#9a9a9a",
-		textMuted: "#5a5a5a",
-
-		statusSuccess: "#7dff73",
-		statusWarn: "#ffd447",
-		statusError: "#ff5a5a",
-
-		accents: {
-			product: "#ffffff",
-			engineering: "#b8b8b8",
-			research: "#8e8e8e",
-			ops: "#ffd447",
-		},
-
-		terminal: {
-			foreground: "#f0f0f0",
-			cursor: "#ffffff",
-			cursorAccent: "#090909",
-			selectionBackground: "#ffffff18",
-			black: "#050505",
-			brightBlack: "#3e3e3e",
-			red: "#ff5a5a",
-			green: "#7dff73",
-			yellow: "#ffd447",
-			blue: "#9a9a9a",
-			magenta: "#d0d0d0",
-			cyan: "#cfcfcf",
-			white: "#f0f0f0",
-			brightWhite: "#ffffff",
-		},
-	},
-
-	marble: {
-		id: "marble",
-		name: "Marble Light",
+	bone: {
+		id: "bone",
+		name: "Bone",
 		kind: "light",
 
-		bgVoid: "#f4f1ec",
-		bgSurface: "#ffffff",
-		bgWell: "#eae6e0",
+		bgVoid: "#f2efe8",
+		bgSurface: "#faf8f4",
+		bgWell: "#faf8f4",
 
-		borderDim: "#d8d2c8",
-		borderGlow: "#c0b8aa",
+		borderDim: "rgba(0, 0, 0, 0.07)",
+		borderGlow: "rgba(0, 0, 0, 0.14)",
 
-		textPrimary: "#2a2520",
-		textSecondary: "#7a7268",
-		textMuted: "#b8b0a4",
+		textPrimary: "#1c1a16",
+		textSecondary: "#6e695e",
+		textMuted: "#a8a296",
 
-		statusSuccess: "#2a7a50",
-		statusWarn: "#a07a28",
-		statusError: "#b83a3a",
+		statusSuccess: "#3a7a50",
+		statusWarn: "#9a7028",
+		statusError: "#a83830",
 
 		accents: {
-			product: "#3a7a6a",
-			engineering: "#5a6abf",
-			research: "#8a5aa0",
-			ops: "#b86a2a",
+			product: "#8a6840",
+			engineering: "#3a7a50",
+			research: "#6a5090",
+			ops: "#9a7028",
 		},
 
 		terminal: {
-			foreground: "#3a3530",
-			cursor: "#3a7a6a",
-			cursorAccent: "#ffffff",
-			selectionBackground: "#00000010",
-			black: "#2a2520",
-			brightBlack: "#7a7268",
-			red: "#b83a3a",
-			green: "#2a7a50",
-			yellow: "#a07a28",
-			blue: "#5a6abf",
-			magenta: "#8a5aa0",
-			cyan: "#3a7a6a",
-			white: "#f4f1ec",
-			brightWhite: "#ffffff",
+			foreground: "#2e2a24",
+			cursor: "#8a6840",
+			cursorAccent: "#faf8f4",
+			selectionBackground: "rgba(138, 104, 64, 0.12)",
+			black: "#2e2a24",
+			brightBlack: "#6e695e",
+			red: "#a83830",
+			green: "#3a7a50",
+			yellow: "#9a7028",
+			blue: "#38608a",
+			magenta: "#6a5090",
+			cyan: "#2a7878",
+			white: "#f2efe8",
+			brightWhite: "#faf8f4",
+		},
+	},
+
+	kark: {
+		id: "kark",
+		name: "Kark",
+		kind: "dark",
+
+		bgVoid: "#09090b",
+		bgSurface: "#121214",
+		bgWell: "#121214",
+
+		borderDim: "rgba(255, 255, 255, 0.05)",
+		borderGlow: "rgba(255, 255, 255, 0.14)",
+
+		textPrimary: "#e8e8ec",
+		textSecondary: "#78787e",
+		textMuted: "#3a3a40",
+
+		statusSuccess: "#b0b0b6",
+		statusWarn: "#9a9a9f",
+		statusError: "#808085",
+
+		accents: {
+			product: "#d0d0d6",
+			engineering: "#a0a0a8",
+			research: "#babac2",
+			ops: "#8a8a92",
+		},
+
+		terminal: {
+			foreground: "#c4c4ca",
+			cursor: "#e8e8ec",
+			cursorAccent: "#121214",
+			selectionBackground: "rgba(255, 255, 255, 0.08)",
+			black: "#09090b",
+			brightBlack: "#48484e",
+			red: "#909096",
+			green: "#b0b0b6",
+			yellow: "#9a9a9f",
+			blue: "#a0a0a8",
+			magenta: "#8a8a92",
+			cyan: "#babac2",
+			white: "#c4c4ca",
+			brightWhite: "#f0f0f4",
+		},
+	},
+
+	carbon: {
+		id: "carbon",
+		name: "Carbon",
+		kind: "dark",
+
+		bgVoid: "#0c0c0e",
+		bgSurface: "#131316",
+		bgWell: "#131316",
+
+		borderDim: "rgba(255, 255, 255, 0.06)",
+		borderGlow: "rgba(255, 255, 255, 0.13)",
+
+		textPrimary: "#e4e4e7",
+		textSecondary: "#71717a",
+		textMuted: "#3f3f46",
+
+		statusSuccess: "#86d993",
+		statusWarn: "#c8a44e",
+		statusError: "#e5534b",
+
+		accents: {
+			product: "#c8a44e",
+			engineering: "#7eb8c9",
+			research: "#a78bda",
+			ops: "#d4886a",
+		},
+
+		terminal: {
+			foreground: "#cdd6f4",
+			cursor: "#c8a44e",
+			cursorAccent: "#131316",
+			selectionBackground: "rgba(199, 164, 78, 0.15)",
+			black: "#0c0c0e",
+			brightBlack: "#45475a",
+			red: "#e5534b",
+			green: "#86d993",
+			yellow: "#e0c078",
+			blue: "#7eb8c9",
+			magenta: "#a78bda",
+			cyan: "#7ec9b8",
+			white: "#bac2de",
+			brightWhite: "#e4e4e7",
 		},
 	},
 };
 
+export const themes = enforceThemeConstraints(baseThemes);
 export const themeIds = Object.keys(themes) as Array<keyof typeof themes>;
-export const defaultThemeId = "jade";
+export const defaultThemeId = "carbon";

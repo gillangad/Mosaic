@@ -1,14 +1,17 @@
-import { motion, Reorder, useDragControls } from "framer-motion";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AnimatePresence, motion, Reorder, useDragControls } from "framer-motion";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent } from "react";
+import { createPortal } from "react-dom";
 import { WorkspaceView } from "./WorkspaceView";
-import { addTabToPane, appendPaneToRight, closeTab, createPaneNode, findAdjacentPaneId, findFirstPaneId, findLastPaneId, findPaneById, rehydrateLayout, resizeFromPane, setActiveTab, splitNode } from "./core/layout";
+import { addTabToPane, appendPaneToRight, closeTab, createPaneNode, findAdjacentPaneId, findFirstPaneId, findLastPaneId, findPaneById, getAllTabIds, rehydrateLayout, resizeFromPane, setActiveTab, splitNode, swapPanes } from "./core/layout";
 import type { FocusDirection } from "./core/layout";
-import type { LayoutNode, WorkspaceModel } from "./core/models";
+import type { LayoutNode, WorkspaceModel, WorkspaceSelection } from "./core/models";
 import type { MosaicTheme } from "./core/themes";
 import { defaultThemeId, themeIds, themes } from "./core/themes";
-import { getWorkspaceTabLabel, serializeWorkspaceState } from "./core/workspaces";
+import { getWorkspaceDisplayName, getWorkspaceTabLabel, serializeWorkspaceState } from "./core/workspaces";
+import { useSessionManager } from "./core/terminal-backend-context";
 
 type ThemeId = keyof typeof themes;
+type FocusMode = "default" | "center" | "edge";
 type SettingsView = "root" | "skins" | "shortcuts";
 
 interface ShortcutDefinition {
@@ -22,6 +25,13 @@ const STORAGE_KEYS = {
 	workspaces: "mosaic.workspaces",
 } as const;
 
+const LEGACY_THEME_IDS: Record<string, ThemeId> = {
+	obsidian: "carbon",
+	dark: "carbon",
+	tron: "carbon",
+	ink: "carbon",
+};
+
 const ACCENT_KEYS = ["product", "engineering", "research", "ops"] as const;
 const SHORTCUTS: ShortcutDefinition[] = [
 	{ action: "Open workspace", keys: "Ctrl Shift O" },
@@ -34,10 +44,41 @@ const SHORTCUTS: ShortcutDefinition[] = [
 	{ action: "Previous tab", keys: "Ctrl Shift Tab" },
 	{ action: "Focus pane", keys: "Ctrl Shift Arrow" },
 	{ action: "Resize pane", keys: "Ctrl Alt Arrow" },
+	{ action: "Toggle pane zoom", keys: "Ctrl Shift M" },
 	{ action: "Previous workspace", keys: "Alt Shift Left / Up" },
 	{ action: "Next workspace", keys: "Alt Shift Right / Down" },
 	{ action: "Open settings", keys: "Ctrl ," },
 ];
+
+const GIT_POLL_INTERVAL_MS = 30_000;
+
+function normalizeWorkspacePath(value: string) {
+	return value.replace(/[\\/]+$/, "");
+}
+
+function countBusyTabs(node: LayoutNode): number {
+	if (node.type === "pane") {
+		return node.pane.tabs.reduce((count, tab) => count + (tab.status === "busy" ? 1 : 0), 0);
+	}
+	return countBusyTabs(node.first) + countBusyTabs(node.second);
+}
+
+function hasFileDrop(event: Pick<ReactDragEvent<HTMLElement>, "dataTransfer">) {
+	return Array.from(event.dataTransfer?.types ?? []).includes("Files");
+}
+
+function isGitStatusEqual(left: WorkspaceModel["git"], right: WorkspaceModel["git"]) {
+	return (
+		left.isRepo === right.isRepo &&
+		left.branch === right.branch &&
+		left.summary === right.summary &&
+		left.dirty === right.dirty &&
+		left.ahead === right.ahead &&
+		left.behind === right.behind &&
+		left.changeCount === right.changeCount &&
+		left.rootPath === right.rootPath
+	);
+}
 
 function buildThemeVars(theme: MosaicTheme) {
 	return {
@@ -54,9 +95,12 @@ function buildThemeVars(theme: MosaicTheme) {
 		["--accent-ice" as string]: theme.accents.engineering,
 		["--accent-signal" as string]: theme.statusSuccess,
 		["--accent-warn" as string]: theme.statusError,
-		["--surface-tint" as string]: theme.kind === "light" ? "rgba(255, 255, 255, 0.78)" : "rgba(6, 10, 16, 0.92)",
-		["--rail-tint" as string]: theme.kind === "light" ? "rgba(255, 255, 255, 0.58)" : "rgba(12, 16, 24, 0.4)",
-		["--tab-active-bg" as string]: theme.kind === "light" ? "rgba(0, 0, 0, 0.03)" : "rgba(255, 255, 255, 0.02)",
+		["--surface-tint" as string]: theme.kind === "light" ? "rgba(255, 255, 255, 0.8)" : `color-mix(in srgb, ${theme.bgSurface} 80%, transparent)`,
+		["--rail-tint" as string]: theme.kind === "light" ? "rgba(250, 250, 250, 0.5)" : `color-mix(in srgb, ${theme.bgSurface} 50%, transparent)`,
+		["--tab-active-bg" as string]: theme.kind === "light" ? "rgba(0, 0, 0, 0.03)" : "rgba(255, 255, 255, 0.03)",
+		["--bg-elevated" as string]: theme.kind === "light"
+			? `color-mix(in srgb, ${theme.bgSurface} 97%, ${theme.textPrimary})`
+			: `color-mix(in srgb, ${theme.bgSurface} 85%, ${theme.textPrimary})`,
 	};
 }
 
@@ -77,7 +121,8 @@ function SkinSwatch({ theme }: { theme: MosaicTheme }) {
 function readStoredThemeId(): ThemeId {
 	if (typeof window === "undefined") return defaultThemeId as ThemeId;
 	const storedThemeId = window.localStorage.getItem(STORAGE_KEYS.themeId);
-	if (storedThemeId && storedThemeId in themes) return storedThemeId as ThemeId;
+	const mappedThemeId = storedThemeId ? (LEGACY_THEME_IDS[storedThemeId] ?? storedThemeId) : null;
+	if (mappedThemeId && mappedThemeId in themes) return mappedThemeId as ThemeId;
 	return defaultThemeId as ThemeId;
 }
 
@@ -86,39 +131,106 @@ function readStoredOrientation() {
 	return window.localStorage.getItem(STORAGE_KEYS.tabOrientation) === "horizontal" ? "horizontal" : "vertical";
 }
 
+
 interface WorkspaceTabItemProps {
 	workspace: WorkspaceModel;
-	index: number;
 	isActive: boolean;
 	accent: string;
+	isRenaming: boolean;
+	renameValue: string;
 	onSelect: () => void;
 	onClose: () => void;
+	onStartRename: () => void;
+	onRenameChange: (value: string) => void;
+	onCommitRename: () => void;
+	onCancelRename: () => void;
 }
 
-function WorkspaceTabItem({ workspace, isActive, accent, onSelect, onClose }: WorkspaceTabItemProps) {
+function WorkspaceTabItem({
+	workspace,
+	isActive,
+	accent,
+	isRenaming,
+	renameValue,
+	onSelect,
+	onClose,
+	onStartRename,
+	onRenameChange,
+	onCommitRename,
+	onCancelRename,
+}: WorkspaceTabItemProps) {
 	const dragControls = useDragControls();
 	const isDraggingRef = useRef(false);
+	const renameInputRef = useRef<HTMLInputElement | null>(null);
+
+	useEffect(() => {
+		if (!isRenaming) return;
+		renameInputRef.current?.focus();
+		renameInputRef.current?.select();
+	}, [isRenaming]);
 
 	return (
 		<Reorder.Item
 			value={workspace}
 			dragListener={false}
 			dragControls={dragControls}
-			className={`workspace-tab ${isActive ? "active" : ""}`}
+			className={`workspace-tab ${isActive ? "active" : ""} ${isRenaming ? "renaming" : ""}`}
 			style={{ ["--workspace-accent" as string]: accent }}
-			onDragStart={() => { isDraggingRef.current = true; }}
-			onDragEnd={() => { setTimeout(() => { isDraggingRef.current = false; }, 0); }}
+			onDragStart={() => {
+				if (isRenaming) return;
+				isDraggingRef.current = true;
+			}}
+			onDragEnd={() => {
+				setTimeout(() => {
+					isDraggingRef.current = false;
+				}, 0);
+			}}
 		>
 			<button
 				type="button"
 				className="workspace-tab-main"
-				onPointerDown={(event) => dragControls.start(event)}
-				onClick={() => { if (!isDraggingRef.current) onSelect(); }}
+				onPointerDown={(event) => {
+					if (isRenaming) return;
+					dragControls.start(event);
+				}}
+				onClick={() => {
+					if (isRenaming || isDraggingRef.current) return;
+					onSelect();
+				}}
+				onDoubleClick={() => {
+					if (isDraggingRef.current) return;
+					onStartRename();
+				}}
 			>
 				<span className="workspace-tab-copy">
-					<span className="workspace-tab-label" title={workspace.path}>
-						{getWorkspaceTabLabel(workspace)}
-					</span>
+					{isRenaming ? (
+						<input
+							ref={renameInputRef}
+							type="text"
+							className="workspace-tab-rename-input"
+							value={renameValue}
+							onChange={(event) => onRenameChange(event.target.value)}
+							onPointerDown={(event) => event.stopPropagation()}
+							onClick={(event) => event.stopPropagation()}
+							onKeyDown={(event) => {
+								if (event.key === "Enter") {
+									event.preventDefault();
+									event.currentTarget.blur();
+									return;
+								}
+								if (event.key === "Escape") {
+									event.preventDefault();
+									onCancelRename();
+								}
+							}}
+							onBlur={onCommitRename}
+							placeholder="Workspace name"
+						/>
+					) : (
+						<span className="workspace-tab-label" title={workspace.path}>
+							{getWorkspaceTabLabel(workspace)}
+						</span>
+					)}
 					{workspace.git.isRepo ? <span className="workspace-tab-meta">{workspace.git.summary}</span> : null}
 				</span>
 			</button>
@@ -129,6 +241,7 @@ function WorkspaceTabItem({ workspace, isActive, accent, onSelect, onClose }: Wo
 					event.stopPropagation();
 					onClose();
 				}}
+				disabled={isRenaming}
 				aria-label={`Close workspace ${getWorkspaceTabLabel(workspace)}`}
 			>
 				×
@@ -155,9 +268,27 @@ export function App() {
 	const [isHydrating, setIsHydrating] = useState(true);
 	const [settingsOpen, setSettingsOpen] = useState(false);
 	const [settingsView, setSettingsView] = useState<SettingsView>("root");
+	const topSettingsButtonRef = useRef<HTMLButtonElement>(null);
+	const railSettingsButtonRef = useRef<HTMLButtonElement>(null);
+	const settingsPanelRef = useRef<HTMLDivElement>(null);
+	const [settingsPanelPosition, setSettingsPanelPosition] = useState({ left: 8, top: 44, maxHeight: 520 });
+	const [overviewOpen, setOverviewOpen] = useState(false);
+	const [renamingWorkspaceId, setRenamingWorkspaceId] = useState<string | null>(null);
+	const [workspaceRenameDraft, setWorkspaceRenameDraft] = useState("");
+	const workspacesRef = useRef<WorkspaceModel[]>([]);
+	const sessionManager = useSessionManager();
 
 	const currentTheme = themes[themeId];
 	const shellStyle = useMemo(() => buildThemeVars(currentTheme), [currentTheme]);
+
+	useEffect(() => {
+		document.documentElement.style.colorScheme = currentTheme.kind;
+		document.documentElement.style.background = currentTheme.bgVoid;
+	}, [currentTheme]);
+
+	useEffect(() => {
+		workspacesRef.current = workspaces;
+	}, [workspaces]);
 
 	const goTo = useCallback(
 		(nextIndex: number) => {
@@ -173,9 +304,25 @@ export function App() {
 
 	const removeWorkspace = useCallback(
 		(workspaceId: string) => {
+			const workspace = workspacesRef.current.find((item) => item.id === workspaceId);
+			if (!workspace) return;
+
+			const busyCount = countBusyTabs(workspace.layout);
+			if (busyCount > 0 && typeof window !== "undefined") {
+				const label = busyCount === 1 ? "terminal" : "terminals";
+				const shouldClose = window.confirm(`${busyCount} ${label} busy — close anyway?`);
+				if (!shouldClose) return;
+			}
+
 			setWorkspaces((current) => {
 				const index = current.findIndex((w) => w.id === workspaceId);
 				if (index < 0) return current;
+
+				const workspaceToRemove = current[index];
+				for (const tabId of getAllTabIds(workspaceToRemove.layout)) {
+					sessionManager.closeSession(tabId);
+				}
+
 				const next = current.filter((w) => w.id !== workspaceId);
 				setActiveIndex((currentActive) => {
 					if (next.length === 0) return 0;
@@ -185,8 +332,13 @@ export function App() {
 				});
 				return next;
 			});
+
+			if (renamingWorkspaceId === workspaceId) {
+				setRenamingWorkspaceId(null);
+				setWorkspaceRenameDraft("");
+			}
 		},
-		[],
+		[renamingWorkspaceId, sessionManager],
 	);
 
 	const reorderWorkspaces = useCallback(
@@ -201,34 +353,22 @@ export function App() {
 		[activeIndex],
 	);
 
-	const addWorkspace = useCallback(async () => {
-		if (typeof window === "undefined" || typeof window.mosaic === "undefined") return;
-		const selected = await window.mosaic.pickWorkspaceDirectory();
-		if (!selected) return;
-
+	const openWorkspaceSelection = useCallback((selection: WorkspaceSelection) => {
 		setWorkspaces((current) => {
-			const existingIndex = current.findIndex((workspace) => workspace.path === selected.path);
+			const normalizedPath = normalizeWorkspacePath(selection.path);
+			const existingIndex = current.findIndex((workspace) => normalizeWorkspacePath(workspace.path) === normalizedPath);
 			if (existingIndex >= 0) {
 				setActiveIndex(existingIndex);
-				return current.map((workspace, index) =>
-					index === existingIndex
-						? {
-								...workspace,
-								git: selected.git,
-								layout: rehydrateLayout(workspace.layout, workspace.path),
-								focusedPaneId: workspace.focusedPaneId ?? findFirstPaneId(workspace.layout),
-						  }
-						: workspace,
-				);
+				return current;
 			}
 
-			const layout = createPaneNode(selected.path);
+			const layout = createPaneNode(selection.path);
 			const next = [
 				...current,
 				{
 					id: crypto.randomUUID(),
-					path: selected.path,
-					git: selected.git,
+					path: selection.path,
+					git: selection.git,
 					layout,
 					focusedPaneId: findFirstPaneId(layout),
 				},
@@ -236,6 +376,71 @@ export function App() {
 			setActiveIndex(next.length - 1);
 			return next;
 		});
+	}, []);
+
+	const addWorkspace = useCallback(async () => {
+		if (typeof window === "undefined" || typeof window.mosaic === "undefined") return;
+		const selected = await window.mosaic.pickWorkspaceDirectory();
+		if (!selected) return;
+		openWorkspaceSelection(selected);
+	}, [openWorkspaceSelection]);
+
+	const openWorkspacesFromPaths = useCallback(
+		async (paths: string[]) => {
+			if (typeof window === "undefined" || typeof window.mosaic === "undefined") return;
+			const uniquePaths = [...new Set(paths.map((value) => normalizeWorkspacePath(value)).filter(Boolean))];
+			for (const droppedPath of uniquePaths) {
+				try {
+					const inspected = await window.mosaic.inspectWorkspace(droppedPath);
+					openWorkspaceSelection(inspected);
+				} catch {
+					// Ignore non-directory drops.
+				}
+			}
+		},
+		[openWorkspaceSelection],
+	);
+
+	const handleWorkspaceDropDragOver = useCallback((event: ReactDragEvent<HTMLElement>) => {
+		if (!hasFileDrop(event)) return;
+		event.preventDefault();
+		event.dataTransfer.dropEffect = "copy";
+	}, []);
+
+	const handleWorkspaceDrop = useCallback(
+		(event: ReactDragEvent<HTMLElement>) => {
+			if (!hasFileDrop(event)) return;
+			event.preventDefault();
+			const droppedPaths = Array.from(event.dataTransfer.files)
+				.map((file) => (file as File & { path?: string }).path)
+				.filter((value): value is string => Boolean(value));
+			if (droppedPaths.length === 0) return;
+			void openWorkspacesFromPaths(droppedPaths);
+		},
+		[openWorkspacesFromPaths],
+	);
+
+	const startWorkspaceRename = useCallback((workspace: WorkspaceModel) => {
+		setRenamingWorkspaceId(workspace.id);
+		setWorkspaceRenameDraft(workspace.customName?.trim() || getWorkspaceDisplayName(workspace));
+	}, []);
+
+	const commitWorkspaceRename = useCallback(
+		(workspaceId: string) => {
+			const nextName = workspaceRenameDraft.trim();
+			updateWorkspace(workspaceId, (workspace) => ({
+				...workspace,
+				customName: nextName.length > 0 ? nextName : undefined,
+			}));
+			setRenamingWorkspaceId(null);
+			setWorkspaceRenameDraft("");
+		},
+		[updateWorkspace, workspaceRenameDraft],
+	);
+
+	const cancelWorkspaceRename = useCallback(() => {
+		setRenamingWorkspaceId(null);
+		setWorkspaceRenameDraft("");
 	}, []);
 
 	useEffect(() => {
@@ -285,6 +490,73 @@ export function App() {
 	}, []);
 
 	useEffect(() => {
+		if (typeof window === "undefined" || typeof window.mosaic === "undefined") return;
+
+		let cancelled = false;
+		let inFlight = false;
+		const pollGitStatus = async () => {
+			if (inFlight) return;
+			const workspaceSnapshot = workspacesRef.current.map(({ id, path }) => ({ id, path }));
+			if (workspaceSnapshot.length === 0) return;
+
+			inFlight = true;
+			try {
+				const nextStatuses = await Promise.all(
+					workspaceSnapshot.map(async (workspace) => {
+						try {
+							const result = await window.mosaic.inspectWorkspace(workspace.path);
+							return { id: workspace.id, git: result.git };
+						} catch {
+							return null;
+						}
+					}),
+				);
+				if (cancelled) return;
+
+				const statusMap = new Map(
+					nextStatuses
+						.filter((item): item is { id: string; git: WorkspaceModel["git"] } => item !== null)
+						.map((item) => [item.id, item.git]),
+				);
+				if (statusMap.size === 0) return;
+
+				setWorkspaces((current) => {
+					let changed = false;
+					const next = current.map((workspace) => {
+						const nextGit = statusMap.get(workspace.id);
+						if (!nextGit || isGitStatusEqual(workspace.git, nextGit)) return workspace;
+						changed = true;
+						return {
+							...workspace,
+							git: nextGit,
+						};
+					});
+					return changed ? next : current;
+				});
+			} finally {
+				inFlight = false;
+			}
+		};
+
+		void pollGitStatus();
+		const intervalId = window.setInterval(() => {
+			void pollGitStatus();
+		}, GIT_POLL_INTERVAL_MS);
+		const handleVisibilityChange = () => {
+			if (document.visibilityState === "visible") {
+				void pollGitStatus();
+			}
+		};
+		document.addEventListener("visibilitychange", handleVisibilityChange);
+
+		return () => {
+			cancelled = true;
+			window.clearInterval(intervalId);
+			document.removeEventListener("visibilitychange", handleVisibilityChange);
+		};
+	}, [workspaces.length]);
+
+	useEffect(() => {
 		if (typeof window === "undefined") return;
 		window.localStorage.setItem(STORAGE_KEYS.themeId, themeId);
 	}, [themeId]);
@@ -303,18 +575,90 @@ export function App() {
 		document.documentElement.dataset.theme = currentTheme.kind;
 	}, [currentTheme.kind]);
 
+	useEffect(() => {
+		if (typeof window === "undefined" || typeof window.mosaic?.updateTitleBarOverlay !== "function") return;
+		window.mosaic.updateTitleBarOverlay({
+			backgroundColor: currentTheme.bgVoid,
+			overlayColor: currentTheme.bgVoid,
+			symbolColor: currentTheme.kind === "light" ? "#3f3f46" : "#a1a1aa",
+		});
+	}, [currentTheme.bgVoid, currentTheme.kind]);
+
+	useEffect(() => {
+		if (!renamingWorkspaceId) return;
+		const exists = workspaces.some((workspace) => workspace.id === renamingWorkspaceId);
+		if (!exists) {
+			setRenamingWorkspaceId(null);
+			setWorkspaceRenameDraft("");
+		}
+	}, [renamingWorkspaceId, workspaces]);
+
 	const closeSettings = useCallback(() => {
 		setSettingsOpen(false);
 		setSettingsView("root");
 	}, []);
 
+	const updateSettingsPanelPosition = useCallback(() => {
+		if (typeof window === "undefined") return;
+
+		const margin = 8;
+		const gap = 6;
+		const anchorButton = tabOrientation === "horizontal" ? topSettingsButtonRef.current : railSettingsButtonRef.current;
+		const buttonRect = anchorButton?.getBoundingClientRect();
+		const panelRect = settingsPanelRef.current?.getBoundingClientRect();
+		const panelWidth = panelRect?.width ?? 260;
+		const panelHeight = panelRect?.height ?? 380;
+
+		let left = tabOrientation === "horizontal" ? 8 : buttonRect ? buttonRect.left : margin;
+		left = Math.min(Math.max(left, margin), Math.max(margin, window.innerWidth - panelWidth - margin));
+
+		let top = tabOrientation === "horizontal" ? 44 : buttonRect ? buttonRect.bottom + gap : 44;
+		if (tabOrientation !== "horizontal" && buttonRect) {
+			const fitsBelow = buttonRect.bottom + gap + panelHeight <= window.innerHeight - margin;
+			const aboveTop = buttonRect.top - gap - panelHeight;
+			if (!fitsBelow && aboveTop >= margin) {
+				top = aboveTop;
+			}
+		}
+		top = Math.min(Math.max(top, margin), Math.max(margin, window.innerHeight - panelHeight - margin));
+
+		const minPanelHeight = tabOrientation === "horizontal" ? 260 : 180;
+		const maxHeight = Math.max(minPanelHeight, window.innerHeight - top - margin);
+		setSettingsPanelPosition((current) => {
+			if (Math.abs(current.left - left) < 0.5 && Math.abs(current.top - top) < 0.5 && Math.abs(current.maxHeight - maxHeight) < 0.5) {
+				return current;
+			}
+			return { left, top, maxHeight };
+		});
+	}, [tabOrientation]);
+
+	useLayoutEffect(() => {
+		if (!settingsOpen) return;
+		updateSettingsPanelPosition();
+		const rafId = window.requestAnimationFrame(updateSettingsPanelPosition);
+		const handleResize = () => updateSettingsPanelPosition();
+		window.addEventListener("resize", handleResize);
+		return () => {
+			window.cancelAnimationFrame(rafId);
+			window.removeEventListener("resize", handleResize);
+		};
+	}, [settingsOpen, settingsView, tabOrientation, workspaces.length, updateSettingsPanelPosition]);
+
 	const activeWorkspace = workspaces[activeIndex];
 	const focusedPaneId = activeWorkspace ? activeWorkspace.focusedPaneId ?? findFirstPaneId(activeWorkspace.layout) : null;
 	const focusedPane = activeWorkspace && focusedPaneId ? findPaneById(activeWorkspace.layout, focusedPaneId) : null;
 
+	useEffect(() => {
+		if (!activeWorkspace) setOverviewOpen(false);
+	}, [activeWorkspace]);
+
 	const openSettings = useCallback((view: SettingsView = "root") => {
 		setSettingsOpen(true);
 		setSettingsView(view);
+	}, []);
+
+		const toggleOverview = useCallback(() => {
+		setOverviewOpen((current) => !current);
 	}, []);
 
 	const focusPane = useCallback(
@@ -327,11 +671,11 @@ export function App() {
 	const addPaneToActiveWorkspace = useCallback(() => {
 		if (!activeWorkspace) return;
 		const nextLayout = appendPaneToRight(activeWorkspace.layout, activeWorkspace.path);
-		const nextFocusedPaneId = findLastPaneId(nextLayout);
+		const insertedPaneId = findLastPaneId(nextLayout);
 		updateWorkspace(activeWorkspace.id, (workspace) => ({
 			...workspace,
 			layout: nextLayout,
-			focusedPaneId: nextFocusedPaneId,
+			focusedPaneId: insertedPaneId,
 		}));
 	}, [activeWorkspace, updateWorkspace]);
 
@@ -360,13 +704,14 @@ export function App() {
 
 	const closeFocusedTab = useCallback(() => {
 		if (!activeWorkspace || !focusedPaneId || !focusedPane) return;
+		sessionManager.closeSession(focusedPane.activeTabId);
 		const nextLayout = closeTab(activeWorkspace.layout, focusedPaneId, focusedPane.activeTabId, activeWorkspace.path);
 		updateWorkspace(activeWorkspace.id, (workspace) => ({
 			...workspace,
 			layout: nextLayout,
 			focusedPaneId,
 		}));
-	}, [activeWorkspace, focusedPane, focusedPaneId, updateWorkspace]);
+	}, [activeWorkspace, focusedPane, focusedPaneId, sessionManager, updateWorkspace]);
 
 	const stepFocusedTab = useCallback(
 		(delta: number) => {
@@ -409,6 +754,18 @@ export function App() {
 
 	useEffect(() => {
 		const handleKeydown = (event: KeyboardEvent) => {
+			if (event.key === "Escape" && renamingWorkspaceId) {
+				event.preventDefault();
+				cancelWorkspaceRename();
+				return;
+			}
+
+			if (event.key === "Escape" && settingsOpen) {
+				event.preventDefault();
+				closeSettings();
+				return;
+			}
+
 			const target = event.target as HTMLElement | null;
 			const isEditableTarget =
 				target instanceof HTMLInputElement ||
@@ -449,6 +806,12 @@ export function App() {
 			if (event.ctrlKey && event.code === "Comma") {
 				event.preventDefault();
 				openSettings();
+				return;
+			}
+
+			if (event.ctrlKey && event.shiftKey && !event.altKey && event.code === "Space") {
+				event.preventDefault();
+				toggleOverview();
 				return;
 			}
 
@@ -510,17 +873,30 @@ export function App() {
 		addPaneToActiveWorkspace,
 		addTabToFocusedPane,
 		addWorkspace,
+		cancelWorkspaceRename,
 		closeFocusedTab,
+		closeSettings,
 		goTo,
 		moveFocus,
 		openSettings,
+		renamingWorkspaceId,
 		resizeFocusedPane,
+		settingsOpen,
 		splitFocusedPane,
 		stepFocusedTab,
 		tabOrientation,
+		toggleOverview,
 	]);
 
 	const project = activeWorkspace;
+	const activeWorkspaceAccent = project ? getWorkspaceAccent(currentTheme, activeIndex) : currentTheme.accents.product;
+	const appShellStyle = useMemo(
+		() => ({
+			...shellStyle,
+			["--workspace-accent" as string]: activeWorkspaceAccent,
+		}),
+		[shellStyle, activeWorkspaceAccent],
+	);
 	const isVertical = tabOrientation === "vertical";
 	const workspaceTabs = (
 		<Reorder.Group
@@ -529,130 +905,194 @@ export function App() {
 			values={workspaces}
 			onReorder={reorderWorkspaces}
 			className={`workspace-tabs ${isVertical ? "vertical" : ""}`}
+			onDragOver={handleWorkspaceDropDragOver}
+			onDrop={handleWorkspaceDrop}
 			aria-label="Workspaces"
 		>
-			{workspaces.map((workspace, index) => (
-				<WorkspaceTabItem
-					key={workspace.id}
-					workspace={workspace}
-					index={index}
-					isActive={index === activeIndex}
-					accent={getWorkspaceAccent(currentTheme, index)}
-					onSelect={() => goTo(index)}
-					onClose={() => removeWorkspace(workspace.id)}
-				/>
-			))}
+			{workspaces.map((workspace, index) => {
+				const isRenaming = renamingWorkspaceId === workspace.id;
+				return (
+					<WorkspaceTabItem
+						key={workspace.id}
+						workspace={workspace}
+						isActive={index === activeIndex}
+						accent={getWorkspaceAccent(currentTheme, index)}
+						isRenaming={isRenaming}
+						renameValue={isRenaming ? workspaceRenameDraft : ""}
+						onSelect={() => {
+							if (renamingWorkspaceId && renamingWorkspaceId !== workspace.id) {
+								commitWorkspaceRename(renamingWorkspaceId);
+							}
+							goTo(index);
+						}}
+						onClose={() => removeWorkspace(workspace.id)}
+						onStartRename={() => startWorkspaceRename(workspace)}
+						onRenameChange={setWorkspaceRenameDraft}
+						onCommitRename={() => commitWorkspaceRename(workspace.id)}
+						onCancelRename={cancelWorkspaceRename}
+					/>
+				);
+			})}
 			<button type="button" className="icon-button workspace-tab-add" onClick={addWorkspace} aria-label="Open directory">
 				+
 			</button>
 		</Reorder.Group>
 	);
 
-	const settingsPanel = (
-		<div className={`settings-panel ${tabOrientation === "vertical" ? "rail" : "topbar"}`}>
-			{settingsView !== "root" ? (
-				<button type="button" className="settings-back" onClick={() => setSettingsView("root")}>
-					Back
-				</button>
-			) : null}
+	const settingsPanel = settingsOpen && typeof document !== "undefined"
+		? createPortal(
+			<>
+				<button
+					type="button"
+					className="settings-scrim"
+					onMouseDown={(event) => {
+						event.preventDefault();
+						closeSettings();
+					}}
+					aria-label="Close settings"
+				/>
+				<div
+					ref={settingsPanelRef}
+					className={`settings-panel ${tabOrientation === "vertical" ? "rail" : "topbar"}`}
+					style={{
+						left: `${settingsPanelPosition.left}px`,
+						top: `${settingsPanelPosition.top}px`,
+						maxHeight: `${settingsPanelPosition.maxHeight}px`,
+					}}
+					role="dialog"
+					aria-label="Settings"
+				>
+					{settingsView !== "root" ? (
+						<button type="button" className="settings-back" onClick={() => setSettingsView("root")}>
+							← Back
+						</button>
+					) : null}
 
-			{settingsView === "root" ? (
-				<>
-					<button
-						type="button"
-						className="settings-item"
-						onClick={() => {
-							setTabOrientation((current) => (current === "horizontal" ? "vertical" : "horizontal"));
-							closeSettings();
-						}}
-					>
-						<span className="settings-item-copy">{tabOrientation === "horizontal" ? "Vertical Tabs" : "Top Tabs"}</span>
-					</button>
-					<button type="button" className="settings-item" onClick={() => setSettingsView("skins")}>
-						<span className="settings-item-copy">Skins</span>
-						<span className="settings-item-chevron">›</span>
-					</button>
-					<button type="button" className="settings-item" onClick={() => setSettingsView("shortcuts")}>
-						<span className="settings-item-copy">Shortcuts</span>
-						<span className="settings-item-chevron">›</span>
-					</button>
-				</>
-			) : null}
-
-			{settingsView === "skins" ? (
-				<div className="settings-section">
-					<div className="settings-item-label">Skin</div>
-					<div className="skin-options" role="list">
-						{themeIds.map((id) => (
+					{settingsView === "root" ? (
+						<>
+							<div className="settings-panel-header">Settings</div>
 							<button
-								key={id}
 								type="button"
-								role="listitem"
-								className={`skin-option ${themeId === id ? "active" : ""}`}
+								className="settings-item"
 								onClick={() => {
-									setThemeId(id as ThemeId);
+									setTabOrientation((current) => (current === "horizontal" ? "vertical" : "horizontal"));
 									closeSettings();
 								}}
 							>
-								<SkinSwatch theme={themes[id]} />
-								<span className="skin-option-copy">{themes[id].name}</span>
+								<span className="settings-item-icon">⊟</span>
+								<span className="settings-item-copy">{tabOrientation === "horizontal" ? "Vertical Tabs" : "Top Tabs"}</span>
 							</button>
-						))}
-					</div>
-				</div>
-			) : null}
+							<button type="button" className="settings-item" onClick={() => setSettingsView("skins")}>
+								<span className="settings-item-icon">◑</span>
+								<span className="settings-item-copy">Skins</span>
+								<span className="settings-item-chevron">›</span>
+							</button>
+							<button type="button" className="settings-item" onClick={() => setSettingsView("shortcuts")}>
+								<span className="settings-item-icon">⌨</span>
+								<span className="settings-item-copy">Shortcuts</span>
+								<span className="settings-item-chevron">›</span>
+							</button>
+						</>
+					) : null}
 
-			{settingsView === "shortcuts" ? (
-				<div className="settings-section">
-					<div className="settings-item-label">Shortcuts</div>
-					<div className="shortcut-list">
-						{SHORTCUTS.map((shortcut) => (
-							<div key={shortcut.action} className="shortcut-item">
-								<span className="shortcut-action">{shortcut.action}</span>
-								<span className="shortcut-keys">{shortcut.keys}</span>
+					{settingsView === "skins" ? (
+						<div className="settings-section">
+							<div className="settings-item-label">Skin</div>
+							<div className="skin-options" role="list">
+								{themeIds.map((id) => (
+									<button
+										key={id}
+										type="button"
+										role="listitem"
+										className={`skin-option ${themeId === id ? "active" : ""}`}
+										onClick={() => {
+											setThemeId(id as ThemeId);
+											closeSettings();
+										}}
+									>
+										<SkinSwatch theme={themes[id]} />
+										<span className="skin-option-copy">{themes[id].name}</span>
+										{themeId === id ? <span className="skin-option-check">✓</span> : null}
+									</button>
+								))}
 							</div>
-						))}
-					</div>
+						</div>
+					) : null}
+
+					{settingsView === "shortcuts" ? (
+						<div className="settings-section">
+							<div className="settings-item-label">Shortcuts</div>
+							<div className="shortcut-list">
+								{SHORTCUTS.map((shortcut) => (
+									<div key={shortcut.action} className="shortcut-item">
+										<span className="shortcut-action">{shortcut.action}</span>
+										<kbd className="shortcut-keys">{shortcut.keys}</kbd>
+									</div>
+								))}
+							</div>
+						</div>
+					) : null}
 				</div>
-			) : null}
-		</div>
-	);
+			</>,
+			document.body,
+		)
+		: null;
 
 	return (
-		<div className="app-shell" style={shellStyle}>
+		<div className="app-shell" style={appShellStyle}>
 			{tabOrientation === "horizontal" ? (
-				<header className="topbar">
+				<header className="topbar titlebar-drag">
+					<div className="settings-anchor settings-anchor-leading topbar-leading-settings">
+						<button
+							ref={topSettingsButtonRef}
+							type="button"
+							className={`icon-button ${settingsOpen ? "active" : ""}`}
+							onClick={() => {
+								if (settingsOpen) {
+									closeSettings();
+									return;
+								}
+								openSettings();
+							}}
+							aria-label="Open settings"
+						>
+							⚙
+						</button>
+					</div>
 					{workspaceTabs}
 
 					<div className="topbar-controls">
-						<div className="settings-anchor">
-							<button
-								type="button"
-								className={`icon-button ${settingsOpen ? "active" : ""}`}
-								onClick={() => {
-									if (settingsOpen) {
-										closeSettings();
-										return;
-									}
-									openSettings();
-								}}
-								aria-label="Open settings"
-							>
-								[]
-							</button>
-							{settingsOpen ? settingsPanel : null}
-						</div>
+						<button
+							type="button"
+							className={`icon-button ${overviewOpen ? "active" : ""}`}
+							onClick={toggleOverview}
+							disabled={!project}
+							aria-label="Toggle overview"
+						>
+							⊞
+						</button>
+						<button
+							type="button"
+							className="new-pane-button"
+							style={{ ["--workspace-accent" as string]: activeWorkspaceAccent }}
+							onClick={addPaneToActiveWorkspace}
+							disabled={!project}
+							aria-label="Add a new pane"
+						>
+							<span className="new-pane-plus">+</span> New Pane
+						</button>
 					</div>
 				</header>
 			) : null}
 
+			{tabOrientation === "vertical" ? <div className="titlebar-strip titlebar-drag" /> : null}
 			<div className={`workspace-shell ${tabOrientation === "vertical" ? "with-vertical-tabs" : ""}`}>
 				{tabOrientation === "vertical" && workspaces.length > 0 ? (
-					<aside className="workspace-rail">
-						<div className="workspace-rail-body">{workspaceTabs}</div>
-						<div className="workspace-rail-footer">
-						<div className="settings-anchor">
-							<button
+					<aside className="workspace-rail" onDragOver={handleWorkspaceDropDragOver} onDrop={handleWorkspaceDrop}>
+						<div className="workspace-rail-header">
+							<div className="settings-anchor">
+								<button
+									ref={railSettingsButtonRef}
 									type="button"
 									className={`icon-button ${settingsOpen ? "active" : ""}`}
 									onClick={() => {
@@ -664,43 +1104,90 @@ export function App() {
 									}}
 									aria-label="Open settings"
 								>
-									[]
+									⚙
 								</button>
-								{settingsOpen ? settingsPanel : null}
 							</div>
+							<span className="rail-label">Workspaces</span>
+						</div>
+						<div className="workspace-rail-body">{workspaceTabs}</div>
+						<div className="workspace-rail-footer">
+							<button
+								type="button"
+								className="new-pane-button rail-new-pane"
+								style={{ ["--workspace-accent" as string]: activeWorkspaceAccent }}
+								onClick={addPaneToActiveWorkspace}
+								disabled={!project}
+								aria-label="Add a new pane"
+							>
+								<span className="new-pane-plus">+</span> New Pane
+							</button>
+							<button
+								type="button"
+								className={`icon-button ${overviewOpen ? "active" : ""}`}
+								onClick={toggleOverview}
+								disabled={!project}
+								aria-label="Toggle overview"
+							>
+								⊞
+							</button>
 						</div>
 					</aside>
 				) : null}
 				<div className="workspace-stage">
-					{workspaces.length === 0 ? (
-						<div className="empty-state">
-							<div className="empty-state-card">
-								<div className="eyebrow">Directory Workspaces</div>
-								<h1 className="empty-state-title">Select a folder to create your first workspace.</h1>
-								<p className="empty-state-copy">
-									Each workspace is a real directory. New panes open in that folder, names are compacted like
-									<code> .../parent/current</code>, and pane tabs reopen next time.
-								</p>
-								<button type="button" className="new-pane-button" onClick={addWorkspace}>
-									<span className="new-pane-plus">+</span> Open Directory
-								</button>
-							</div>
-						</div>
-					) : (
-						workspaces.map((ws, index) => (
-							<div
-								key={ws.id}
+					<AnimatePresence initial={false} mode="wait">
+						{workspaces.length === 0 ? (
+							<motion.div
+								key="empty"
+								className="empty-state"
+								onDragOver={handleWorkspaceDropDragOver}
+								onDrop={handleWorkspaceDrop}
+								initial={{ opacity: 0, scale: 0.995, y: 4 }}
+								animate={{ opacity: 1, scale: 1, y: 0 }}
+								exit={{ opacity: 0, scale: 0.995, y: -2 }}
+								transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
+							>
+								<div className="empty-state-hero">
+									<h1 className="empty-state-brand">Mosaic</h1>
+									<p className="empty-state-tagline">Open a directory to begin.</p>
+									<button type="button" className="empty-state-cta" onClick={addWorkspace}>
+										Open Directory
+									</button>
+								</div>
+							</motion.div>
+						) : activeWorkspace ? (
+							<motion.div
+								key={activeWorkspace.id}
 								className="workspace-panel"
-								style={{ display: index === activeIndex ? "block" : "none" }}
+								initial={{ opacity: 0, scale: 0.995, y: 2 }}
+								animate={{ opacity: 1, scale: 1, y: 0 }}
+								exit={{ opacity: 0, scale: 0.995, y: -1 }}
+								transition={{ duration: 0.19, ease: [0.22, 1, 0.36, 1] }}
 							>
 								<WorkspaceView
-									workspace={ws}
-									accent={getWorkspaceAccent(currentTheme, index)}
+									workspace={activeWorkspace}
+									accent={activeWorkspaceAccent}
 									theme={currentTheme}
-									focusedPaneId={ws.focusedPaneId}
-									onFocusPane={(paneId) => focusPane(ws.id, paneId)}
+									focusMode="center"
+									overviewOpen={overviewOpen}
+									onExitOverview={() => setOverviewOpen(false)}
+									focusedPaneId={activeWorkspace.focusedPaneId}
+									onFocusPane={(paneId) => focusPane(activeWorkspace.id, paneId)}
+									onSwapPanes={(sourcePaneId, targetPaneId) =>
+										updateWorkspace(activeWorkspace.id, (workspace) => ({
+											...workspace,
+											layout: swapPanes(workspace.layout, sourcePaneId, targetPaneId),
+											focusedPaneId: sourcePaneId,
+										}))
+									}
+									onSplitPane={(paneId, direction) =>
+										updateWorkspace(activeWorkspace.id, (workspace) => ({
+											...workspace,
+											layout: splitNode(workspace.layout, paneId, direction, workspace.path),
+											focusedPaneId: paneId,
+										}))
+									}
 									onUpdateLayout={(layout) =>
-										updateWorkspace(ws.id, (workspace) => ({
+										updateWorkspace(activeWorkspace.id, (workspace) => ({
 											...workspace,
 											layout,
 											focusedPaneId:
@@ -710,12 +1197,13 @@ export function App() {
 										}))
 									}
 								/>
-							</div>
-						))
-					)}
+							</motion.div>
+						) : null}
+					</AnimatePresence>
 				</div>
 			</div>
 
+			{settingsPanel}
 		</div>
 	);
 }

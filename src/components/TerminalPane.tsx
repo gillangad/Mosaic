@@ -1,14 +1,12 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type DragEvent as ReactDragEvent } from "react";
 import { Terminal } from "xterm";
 import { FitAddon } from "xterm-addon-fit";
 import { SearchAddon } from "xterm-addon-search";
+import { SerializeAddon } from "xterm-addon-serialize";
 import { WebLinksAddon } from "xterm-addon-web-links";
-import { WebglAddon } from "xterm-addon-webgl";
-import { Unicode11Addon } from "xterm-addon-unicode11";
-import { useTerminalBackend } from "../core/terminal-backend-context";
-import type { PaneStatus, PaneModel, TerminalTabModel } from "../core/models";
+import { useSessionManager, useTerminalBackend } from "../core/terminal-backend-context";
+import type { PaneModel, TerminalTabModel } from "../core/models";
 import type { MosaicTheme } from "../core/themes";
-import { normalizeShellLabel } from "../core/terminal-utils";
 
 interface TerminalTabSurfaceProps {
 	tab: TerminalTabModel;
@@ -25,6 +23,7 @@ interface TerminalPaneProps {
 	theme: MosaicTheme;
 	cwd: string;
 	focused: boolean;
+	zoomed: boolean;
 	onFocus: () => void;
 	onSplitVertical: () => void;
 	onSplitHorizontal: () => void;
@@ -32,6 +31,8 @@ interface TerminalPaneProps {
 	onAddTab: () => void;
 	onSelectTab: (tabId: string) => void;
 	onCloseTab: (tabId: string) => void;
+	onMoveTab: (sourcePaneId: string, tabId: string, targetPaneId: string) => void;
+	onToggleZoom: () => void;
 	onUpdateTabMeta: (tabId: string, patch: Partial<Pick<TerminalTabModel, "status" | "shellLabel" | "message">>) => void;
 }
 
@@ -55,12 +56,28 @@ function buildTerminalTheme(theme: MosaicTheme, accent: string) {
 	};
 }
 
+const PANE_TAB_DND_TYPE = "application/x-mosaic-pane-tab";
+
+function parseDraggedTab(event: Pick<DragEvent, "dataTransfer">) {
+	const payload = event.dataTransfer?.getData(PANE_TAB_DND_TYPE);
+	if (!payload) return null;
+	try {
+		const parsed = JSON.parse(payload) as { sourcePaneId?: string; tabId?: string };
+		if (!parsed.sourcePaneId || !parsed.tabId) return null;
+		return { sourcePaneId: parsed.sourcePaneId, tabId: parsed.tabId };
+	} catch {
+		return null;
+	}
+}
+
 function TerminalTabSurface({ tab, accent, theme, cwd, isActive, onUpdateTabMeta }: TerminalTabSurfaceProps) {
 	const backend = useTerminalBackend();
+	const sessionManager = useSessionManager();
 	const terminalRef = useRef<HTMLDivElement | null>(null);
 	const terminalInstanceRef = useRef<Terminal | null>(null);
 	const fitAddonRef = useRef<FitAddon | null>(null);
 	const searchAddonRef = useRef<SearchAddon | null>(null);
+	const serializeAddonRef = useRef<SerializeAddon | null>(null);
 	const sessionRef = useRef<string | null>(null);
 	const idleTimerRef = useRef<number | null>(null);
 	const unsubscribeRef = useRef<(() => void) | null>(null);
@@ -89,14 +106,18 @@ function TerminalTabSurface({ tab, accent, theme, cwd, isActive, onUpdateTabMeta
 
 		let terminal: Terminal;
 		let fitAddon: FitAddon;
+		let serializeAddon: SerializeAddon;
+		let inputDisposable: { dispose: () => void } | null = null;
+		let snapshotIntervalId: number | null = null;
 
 		try {
 			terminal = new Terminal({
-				fontFamily: '"IBM Plex Mono", "JetBrains Mono", monospace',
+				fontFamily: '"JetBrains Mono", "SF Mono", "Fira Code", monospace',
 				fontSize: 12,
 				lineHeight: 1.18,
 				cursorBlink: true,
 				allowTransparency: true,
+				allowProposedApi: true,
 				theme: buildTerminalTheme(theme, accent),
 			});
 
@@ -105,25 +126,19 @@ function TerminalTabSurface({ tab, accent, theme, cwd, isActive, onUpdateTabMeta
 			const webLinksAddon = new WebLinksAddon((_event, uri) => {
 				window.open(uri, "_blank");
 			});
-			const unicode11Addon = new Unicode11Addon();
+			serializeAddon = new SerializeAddon();
 
 			terminal.loadAddon(fitAddon);
 			terminal.loadAddon(searchAddon);
 			terminal.loadAddon(webLinksAddon);
-			terminal.loadAddon(unicode11Addon);
-			terminal.unicode.activeVersion = "11";
+			terminal.loadAddon(serializeAddon);
 
 			terminal.open(terminalRef.current);
-
-			try {
-				const webglAddon = new WebglAddon();
-				webglAddon.onContextLoss(() => webglAddon.dispose());
-				terminal.loadAddon(webglAddon);
-			} catch {
-				// WebGL unavailable — canvas renderer is fine
-			}
+			const snapshot = sessionManager.getSnapshot(tab.id);
+			if (snapshot) terminal.write(snapshot);
 
 			searchAddonRef.current = searchAddon;
+			serializeAddonRef.current = serializeAddon;
 			fitAddon.fit();
 		} catch (error) {
 			updateTabMetaRef.current({
@@ -145,14 +160,14 @@ function TerminalTabSurface({ tab, accent, theme, cwd, isActive, onUpdateTabMeta
 			idleTimerRef.current = window.setTimeout(() => updateTabMetaRef.current({ status: "idle" }), 900);
 		};
 
-		backend
-			.createSession({ cwd })
-			.then((session) => {
+		sessionManager
+			.ensureSession(tab.id, cwd)
+			.then((sessionId) => {
 				if (disposed) return;
 
-				sessionRef.current = session.id;
+				sessionRef.current = sessionId;
 				updateTabMetaRef.current({
-					shellLabel: normalizeShellLabel(session.shell),
+					shellLabel: sessionManager.getShellLabel(tab.id) ?? tab.shellLabel ?? "shell",
 					status: "idle",
 					message: "Connected",
 				});
@@ -165,7 +180,7 @@ function TerminalTabSurface({ tab, accent, theme, cwd, isActive, onUpdateTabMeta
 
 				resizeTerminal();
 
-				unsubscribeRef.current = backend.subscribe(session.id, {
+				unsubscribeRef.current = backend.subscribe(sessionId, {
 					onData: (data) => {
 						terminal.write(data);
 						markBusy();
@@ -179,7 +194,7 @@ function TerminalTabSurface({ tab, accent, theme, cwd, isActive, onUpdateTabMeta
 					},
 				});
 
-				terminal.onData((data) => {
+				inputDisposable = terminal.onData((data) => {
 					if (!sessionRef.current) return;
 					markBusy();
 					void backend.write(sessionRef.current, data);
@@ -187,6 +202,11 @@ function TerminalTabSurface({ tab, accent, theme, cwd, isActive, onUpdateTabMeta
 
 				resizeObserverRef.current = new ResizeObserver(resizeTerminal);
 				if (terminalRef.current) resizeObserverRef.current.observe(terminalRef.current);
+
+				snapshotIntervalId = window.setInterval(() => {
+					if (!serializeAddonRef.current) return;
+					sessionManager.setSnapshot(tab.id, serializeAddonRef.current.serialize());
+				}, 1200);
 			})
 			.catch((error: unknown) => {
 				updateTabMetaRef.current({
@@ -199,13 +219,20 @@ function TerminalTabSurface({ tab, accent, theme, cwd, isActive, onUpdateTabMeta
 		return () => {
 			disposed = true;
 			if (idleTimerRef.current) window.clearTimeout(idleTimerRef.current);
+			if (snapshotIntervalId) window.clearInterval(snapshotIntervalId);
 			resizeObserverRef.current?.disconnect();
+			resizeObserverRef.current = null;
 			unsubscribeRef.current?.();
-			if (sessionRef.current) void backend.close(sessionRef.current);
+			unsubscribeRef.current = null;
+			inputDisposable?.dispose();
+			if (serializeAddonRef.current) {
+				sessionManager.setSnapshot(tab.id, serializeAddonRef.current.serialize());
+			}
 			terminalInstanceRef.current = null;
+			sessionRef.current = null;
 			terminal.dispose();
 		};
-	}, [backend, cwd, isActive, tab.id]);
+	}, [backend, tab.id]);
 
 	useEffect(() => {
 		if (!isActive || !terminalInstanceRef.current) return;
@@ -350,6 +377,7 @@ export function TerminalPane({
 	theme,
 	cwd,
 	focused,
+	zoomed,
 	onFocus,
 	onSplitVertical,
 	onSplitHorizontal,
@@ -357,27 +385,81 @@ export function TerminalPane({
 	onAddTab,
 	onSelectTab,
 	onCloseTab,
+	onMoveTab,
+	onToggleZoom,
 	onUpdateTabMeta,
 }: TerminalPaneProps) {
 	const activeTab = pane.tabs.find((tab) => tab.id === pane.activeTabId) ?? pane.tabs[0];
+	const [tabDropActive, setTabDropActive] = useState(false);
+	const [draggingTabId, setDraggingTabId] = useState<string | null>(null);
+
+	const handleTabStripDragOver = useCallback(
+		(event: ReactDragEvent<HTMLDivElement>) => {
+			const payload = parseDraggedTab(event);
+			if (!payload || payload.sourcePaneId === pane.id) return;
+			event.preventDefault();
+			event.dataTransfer.dropEffect = "move";
+			setTabDropActive(true);
+		},
+		[pane.id],
+	);
+
+	const handleTabStripDrop = useCallback(
+		(event: ReactDragEvent<HTMLDivElement>) => {
+			setTabDropActive(false);
+			const payload = parseDraggedTab(event);
+			if (!payload || payload.sourcePaneId === pane.id) return;
+			event.preventDefault();
+			onMoveTab(payload.sourcePaneId, payload.tabId, pane.id);
+		},
+		[onMoveTab, pane.id],
+	);
 
 	return (
 		<section
-			className={`terminal-pane ${focused ? "focused" : ""}`}
+			className={`terminal-pane ${focused ? "focused" : ""} ${zoomed ? "zoomed" : ""}`}
 			style={{ ["--workspace-accent" as string]: accent, ["--glow-color" as string]: accent }}
 			onMouseDown={onFocus}
 		>
 			<div className="terminal-pane-accent" />
 
-			<div className="pane-header pane-header-tabs">
-				<div className="pane-tab-strip">
+			<div
+				className="pane-header pane-header-tabs"
+				onDoubleClick={(event) => {
+					const target = event.target as HTMLElement;
+					if (target.closest("button") || target.closest('[role="button"]')) return;
+					onToggleZoom();
+				}}
+			>
+				<div
+					className={`pane-tab-strip ${tabDropActive ? "tab-drop-target" : ""}`}
+					onDragOver={handleTabStripDragOver}
+					onDrop={handleTabStripDrop}
+					onDragLeave={(event) => {
+						const nextTarget = event.relatedTarget as Node | null;
+						if (nextTarget && event.currentTarget.contains(nextTarget)) return;
+						setTabDropActive(false);
+					}}
+				>
 					{pane.tabs.map((tab) => (
 						<button
 							key={tab.id}
 							type="button"
-							className={`pane-tab-button ${tab.id === activeTab.id ? "active" : ""}`}
+							draggable
+							className={`pane-tab-button ${tab.id === activeTab.id ? "active" : ""} ${draggingTabId === tab.id ? "tab-dragging" : ""}`}
+							onDragStart={(event) => {
+								setDraggingTabId(tab.id);
+								event.dataTransfer.effectAllowed = "move";
+								event.dataTransfer.setData(PANE_TAB_DND_TYPE, JSON.stringify({ sourcePaneId: pane.id, tabId: tab.id }));
+								event.dataTransfer.setData("text/plain", tab.id);
+							}}
+							onDragEnd={() => {
+								setDraggingTabId(null);
+								setTabDropActive(false);
+							}}
 							onClick={() => onSelectTab(tab.id)}
 							title={tab.title}
+							aria-grabbed={draggingTabId === tab.id}
 						>
 							<span className={`status-dot pane-tab-status status-${tab.status}`} />
 							<span className="pane-tab-title">{tab.title}</span>
@@ -398,7 +480,7 @@ export function TerminalPane({
 										}
 									}}
 								>
-									x
+									×
 								</span>
 							) : null}
 						</button>
@@ -409,15 +491,26 @@ export function TerminalPane({
 				</div>
 
 				<div className="pane-actions">
-					<button type="button" className="pane-action-button" onClick={onSplitVertical} aria-label={`Split ${activeTab.title} vertically`}>
-						|
-					</button>
-					<button type="button" className="pane-action-button" onClick={onSplitHorizontal} aria-label={`Split ${activeTab.title} horizontally`}>
-						-
-					</button>
-					<button type="button" className="pane-close-button" onClick={onClose} aria-label={`Close ${activeTab.title}`}>
-						x
-					</button>
+					{zoomed ? <span className="pane-zoom-pill">Focus mode</span> : null}
+					<div className="pane-action-slot" data-tooltip={zoomed ? "Exit focus mode" : "Focus this pane"}>
+						<button
+							type="button"
+							className={`pane-action-button zoom-toggle ${zoomed ? "active" : ""}`}
+							onClick={onToggleZoom}
+							aria-label={zoomed ? "Exit focus mode" : "Focus this pane"}
+						/>
+					</div>
+					<div className="pane-action-slot" data-tooltip="Split vertically">
+						<button type="button" className="pane-action-button split-v" onClick={onSplitVertical} aria-label={`Split ${activeTab.title} vertically`} />
+					</div>
+					<div className="pane-action-slot" data-tooltip="Split horizontally">
+						<button type="button" className="pane-action-button split-h" onClick={onSplitHorizontal} aria-label={`Split ${activeTab.title} horizontally`} />
+					</div>
+					<div className="pane-action-slot" data-tooltip="Close pane">
+						<button type="button" className="pane-close-button" onClick={onClose} aria-label={`Close ${activeTab.title}`}>
+							×
+						</button>
+					</div>
 				</div>
 			</div>
 

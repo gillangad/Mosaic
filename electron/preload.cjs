@@ -7,6 +7,7 @@ contextBridge.exposeInMainWorld("mosaic", {
 	closeTerminal: (id) => ipcRenderer.invoke("terminal:close", id),
 	pickWorkspaceDirectory: () => ipcRenderer.invoke("workspace:pickDirectory"),
 	inspectWorkspace: (directoryPath) => ipcRenderer.invoke("workspace:inspect", directoryPath),
+	updateTitleBarOverlay: (payload) => ipcRenderer.invoke("window:updateTitleBarOverlay", payload),
 	subscribeTerminal: (id, handlers) => {
 		const dataChannel = `terminal:data:${id}`;
 		const exitChannel = `terminal:exit:${id}`;

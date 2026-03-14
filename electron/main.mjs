@@ -1,6 +1,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { execFile } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { promisify } from "node:util";
 import { app, BrowserWindow, dialog, ipcMain, Menu } from "electron";
 import os from "node:os";
@@ -16,9 +17,33 @@ if (process.platform === "linux") {
 	app.disableHardwareAcceleration();
 }
 
+function resolveWindowsDefaultShell() {
+	const wherePwsh = spawnSync("where.exe", ["pwsh.exe"], {
+		encoding: "utf8",
+		windowsHide: true,
+	});
+	if (wherePwsh.status === 0) {
+		const onPath = wherePwsh.stdout.split(/\r?\n/).find(Boolean)?.trim();
+		if (onPath) return onPath;
+		return "pwsh.exe";
+	}
+
+	const candidates = [
+		process.env.ProgramFiles ? path.join(process.env.ProgramFiles, "PowerShell", "7", "pwsh.exe") : null,
+		process.env["ProgramFiles(x86)"] ? path.join(process.env["ProgramFiles(x86)"], "PowerShell", "7", "pwsh.exe") : null,
+		process.env.ProgramW6432 ? path.join(process.env.ProgramW6432, "PowerShell", "7", "pwsh.exe") : null,
+	].filter(Boolean);
+
+	for (const candidate of candidates) {
+		if (existsSync(candidate)) return candidate;
+	}
+
+	return process.env.ComSpec || "cmd.exe";
+}
+
 function getDefaultShell() {
 	if (process.platform === "win32") {
-		return process.env.ComSpec || "powershell.exe";
+		return resolveWindowsDefaultShell();
 	}
 
 	return process.env.SHELL || "/bin/bash";
@@ -87,14 +112,23 @@ async function inspectWorkspace(directoryPath) {
 }
 
 function createWindow() {
+	const isMac = process.platform === "darwin";
+
 	const win = new BrowserWindow({
 		width: 1480,
 		height: 920,
 		minWidth: 1100,
 		minHeight: 720,
-		backgroundColor: "#0b0d12",
+		backgroundColor: "#0c0c0e",
 		autoHideMenuBar: true,
-		titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
+		titleBarStyle: isMac ? "hiddenInset" : "hidden",
+		titleBarOverlay: isMac
+			? false
+			: {
+				color: "#0c0c0e",
+				symbolColor: "#71717a",
+				height: 36,
+			},
 		webPreferences: {
 			preload: path.join(__dirname, "preload.cjs"),
 			contextIsolation: true,
@@ -125,23 +159,32 @@ function createPtySession(options = {}) {
 	const shell = getDefaultShell();
 	const cwd = options.cwd || os.homedir();
 
+	const spawnOptions = {
+		name: "xterm-256color",
+		env: process.env,
+		cols: 120,
+		rows: 36,
+	};
+
 	let proc;
 	try {
 		proc = pty.spawn(shell, [], {
-			name: "xterm-256color",
+			...spawnOptions,
 			cwd,
-			env: process.env,
-			cols: 120,
-			rows: 36,
 		});
 	} catch {
-		proc = pty.spawn(shell, [], {
-			name: "xterm-256color",
-			cwd: os.homedir(),
-			env: process.env,
-			cols: 120,
-			rows: 36,
-		});
+		try {
+			proc = pty.spawn(shell, [], {
+				...spawnOptions,
+				cwd: os.homedir(),
+			});
+		} catch {
+			const fallbackShell = process.platform === "win32" ? process.env.ComSpec || "cmd.exe" : process.env.SHELL || "/bin/bash";
+			proc = pty.spawn(fallbackShell, [], {
+				...spawnOptions,
+				cwd: os.homedir(),
+			});
+		}
 	}
 
 	sessions.set(id, proc);
@@ -163,6 +206,21 @@ ipcMain.handle("workspace:pickDirectory", async () => {
 });
 
 ipcMain.handle("workspace:inspect", (_event, directoryPath) => inspectWorkspace(directoryPath));
+
+ipcMain.handle("window:updateTitleBarOverlay", (event, payload = {}) => {
+	const win = BrowserWindow.fromWebContents(event.sender);
+	if (!win || process.platform === "darwin") return;
+	const overlayColor = payload.overlayColor ?? payload.backgroundColor ?? "#0c0c0e";
+	const symbolColor = payload.symbolColor ?? "#71717a";
+	win.setBackgroundColor(payload.backgroundColor ?? overlayColor);
+	if (typeof win.setTitleBarOverlay === "function") {
+		win.setTitleBarOverlay({
+			color: overlayColor,
+			symbolColor,
+			height: 36,
+		});
+	}
+});
 
 ipcMain.handle("terminal:write", (_event, payload) => {
 	const proc = sessions.get(payload.id);
@@ -244,6 +302,10 @@ ipcMain.on("context-menu:terminal", (event, payload) => {
 });
 
 app.whenReady().then(() => {
+	if (process.platform !== "darwin") {
+		Menu.setApplicationMenu(null);
+	}
+
 	createWindow();
 
 	app.on("activate", () => {
