@@ -1,0 +1,9 @@
+node_modules
+dist
+release
+.amp
+
+# Internal docs — not for public repo
+AGENTS.md
+vision.md
+migrate-ghostty-web.md

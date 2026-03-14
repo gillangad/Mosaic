@@ -1,0 +1,31 @@
+{
+	"appId": "com.mosaic.app",
+	"productName": "Mosaic",
+	"directories": {
+		"output": "release"
+	},
+	"files": [
+		"dist/**/*",
+		"electron/**/*",
+		"node_modules/**/*",
+		"package.json"
+	],
+	"win": {
+		"target": ["nsis", "portable"],
+		"icon": null
+	},
+	"mac": {
+		"target": ["dmg"],
+		"category": "public.app-category.developer-tools",
+		"icon": null
+	},
+	"linux": {
+		"target": ["AppImage", "deb"],
+		"category": "Development",
+		"icon": null
+	},
+	"nsis": {
+		"oneClick": false,
+		"allowToChangeInstallationDirectory": true
+	}
+}
