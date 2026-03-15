@@ -3,7 +3,26 @@ dist
 release
 .amp
 
-# Internal docs — not for public repo
-AGENTS.md
-vision.md
-migrate-ghostty-web.md
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor / IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.*
+
+# Internal docs — ignore all .md except README
+*.md
+!README.md
