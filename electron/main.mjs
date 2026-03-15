@@ -13,6 +13,33 @@ const execFileAsync = promisify(execFile);
 
 const sessions = new Map();
 
+function closeTrackedSession(session) {
+	if (!session || session.closed || session.closing) return;
+	session.closing = true;
+	try {
+		session.proc.kill();
+	} catch {
+		session.closed = true;
+		sessions.delete(session.id);
+	}
+}
+
+function normalizeSubscriptionPayload(payload) {
+	if (typeof payload === "string") {
+		return {
+			id: payload,
+			subscriptionId: null,
+		};
+	}
+
+	if (!payload || typeof payload !== "object") return null;
+	if (typeof payload.id !== "string") return null;
+	return {
+		id: payload.id,
+		subscriptionId: typeof payload.subscriptionId === "string" ? payload.subscriptionId : null,
+	};
+}
+
 if (process.platform === "linux") {
 	app.disableHardwareAcceleration();
 }
@@ -187,7 +214,22 @@ function createPtySession(options = {}) {
 		}
 	}
 
-	sessions.set(id, proc);
+	const session = {
+		id,
+		proc,
+		shell,
+		cwd,
+		closing: false,
+		closed: false,
+	};
+
+	proc.onExit(() => {
+		session.closed = true;
+		session.closing = false;
+		sessions.delete(id);
+	});
+
+	sessions.set(id, session);
 	return { id, shell, cwd };
 }
 
@@ -223,46 +265,83 @@ ipcMain.handle("window:updateTitleBarOverlay", (event, payload = {}) => {
 });
 
 ipcMain.handle("terminal:write", (_event, payload) => {
-	const proc = sessions.get(payload.id);
-	if (proc) proc.write(payload.data);
+	const session = sessions.get(payload.id);
+	if (!session || session.closed) return;
+	try {
+		session.proc.write(payload.data);
+	} catch {
+		// Ignore writes for sessions that are in the middle of closing.
+	}
 });
 
 ipcMain.handle("terminal:resize", (_event, payload) => {
-	const proc = sessions.get(payload.id);
-	if (proc) proc.resize(payload.cols, payload.rows);
+	const session = sessions.get(payload.id);
+	if (!session || session.closed) return;
+	try {
+		session.proc.resize(payload.cols, payload.rows);
+	} catch {
+		// Ignore resize races during teardown.
+	}
 });
 
 ipcMain.handle("terminal:close", (_event, id) => {
-	const proc = sessions.get(id);
-	if (!proc) return;
-	proc.kill();
-	sessions.delete(id);
+	const session = sessions.get(id);
+	if (!session) return;
+	closeTrackedSession(session);
 });
 
-ipcMain.on("terminal:subscribe", (event, id) => {
-	const proc = sessions.get(id);
-	if (!proc) return;
+ipcMain.on("terminal:subscribe", (event, payload) => {
+	const normalized = normalizeSubscriptionPayload(payload);
+	if (!normalized) return;
+
+	const { id, subscriptionId } = normalized;
+	const session = sessions.get(id);
+	if (!session || session.closed) return;
+
+	let cleaned = false;
+	let dataDisposable;
+	let exitDisposable;
+
+	function cleanup() {
+		if (cleaned) return;
+		cleaned = true;
+		dataDisposable?.dispose();
+		exitDisposable?.dispose();
+		ipcMain.removeListener("terminal:unsubscribe", unsubscribeListener);
+		event.sender.removeListener("destroyed", handleSenderDestroyed);
+	}
+
+	function handleSenderDestroyed() {
+		cleanup();
+	}
+
+	function unsubscribeListener(unsubscribeEvent, message) {
+		if (unsubscribeEvent.sender !== event.sender) return;
+		if (!message || message.id !== id) return;
+		if (subscriptionId && message.subscriptionId !== subscriptionId) return;
+		cleanup();
+	}
 
 	const sendData = (data) => {
+		if (event.sender.isDestroyed()) {
+			cleanup();
+			return;
+		}
 		event.sender.send(`terminal:data:${id}`, data);
 	};
 
 	const sendExit = (eventData) => {
-		event.sender.send(`terminal:exit:${id}`, eventData);
+		if (!event.sender.isDestroyed()) {
+			event.sender.send(`terminal:exit:${id}`, eventData);
+		}
 		cleanup();
-		sessions.delete(id);
 	};
 
-	const dataDisposable = proc.onData(sendData);
-	const exitDisposable = proc.onExit(sendExit);
+	dataDisposable = session.proc.onData(sendData);
+	exitDisposable = session.proc.onExit(sendExit);
 
-		const cleanup = () => {
-			dataDisposable.dispose();
-			exitDisposable.dispose();
-			ipcMain.removeListener(`terminal:unsubscribe:${id}`, cleanup);
-		};
-
-		ipcMain.once(`terminal:unsubscribe:${id}`, cleanup);
+	ipcMain.on("terminal:unsubscribe", unsubscribeListener);
+	event.sender.once("destroyed", handleSenderDestroyed);
 });
 
 ipcMain.on("context-menu:terminal", (event, payload) => {
@@ -314,7 +393,9 @@ app.whenReady().then(() => {
 });
 
 app.on("window-all-closed", () => {
-	for (const proc of sessions.values()) proc.kill();
+	for (const session of sessions.values()) {
+		closeTrackedSession(session);
+	}
 	sessions.clear();
 
 	if (process.platform !== "darwin") app.quit();

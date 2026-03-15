@@ -8,6 +8,7 @@ type PathEntry = { node: SplitLayoutNode; branch: "first" | "second" };
 
 const DEFAULT_WIDTH_UNITS = 1;
 const APPENDED_PANE_WIDTH_UNITS = 0.5;
+export const COLUMN_INSERT_WIDTH_UNITS = APPENDED_PANE_WIDTH_UNITS;
 
 function clampWidthUnits(value: number) {
 	return Math.max(0.01, value);
@@ -429,6 +430,83 @@ export function movePane(
 	if (!findPaneById(layoutWithoutSource, targetPaneId)) return node;
 
 	return insertPaneAtTarget(layoutWithoutSource, targetPaneId, position, sourcePane);
+}
+
+export function detachPaneToSide(
+	node: LayoutNode,
+	sourcePaneId: string,
+	side: "left" | "right",
+): LayoutNode {
+	const sourcePane = findPaneById(node, sourcePaneId);
+	if (!sourcePane) return node;
+
+	const layoutWithoutSource = removePane(node, sourcePaneId);
+	if (!layoutWithoutSource) return node;
+
+	const existingWidthUnits = getNodeWidthUnits(layoutWithoutSource);
+	const insertedWidthUnits = APPENDED_PANE_WIDTH_UNITS;
+	const totalWidthUnits = existingWidthUnits + insertedWidthUnits;
+	const insertedNode = createPaneNodeFromModel(sourcePane, insertedWidthUnits);
+
+	return {
+		type: "split",
+		id: crypto.randomUUID(),
+		direction: "vertical",
+		ratio: side === "left"
+			? insertedWidthUnits / totalWidthUnits
+			: existingWidthUnits / totalWidthUnits,
+		widthUnits: totalWidthUnits,
+		first: side === "left" ? insertedNode : resizeLayoutWidth(layoutWithoutSource, existingWidthUnits),
+		second: side === "left" ? resizeLayoutWidth(layoutWithoutSource, existingWidthUnits) : insertedNode,
+	};
+}
+
+function collectRootColumns(node: LayoutNode, result: LayoutNode[]) {
+	if (node.type === "split" && node.direction === "vertical") {
+		collectRootColumns(node.first, result);
+		collectRootColumns(node.second, result);
+		return;
+	}
+
+	result.push(node);
+}
+
+function buildRootColumns(columns: LayoutNode[]): LayoutNode {
+	if (columns.length === 1) {
+		const widthUnits = getNodeWidthUnits(columns[0]);
+		return resizeLayoutWidth(columns[0], widthUnits);
+	}
+
+	const [first, ...rest] = columns;
+	const second = buildRootColumns(rest);
+	const firstWidthUnits = getNodeWidthUnits(first);
+	const secondWidthUnits = getNodeWidthUnits(second);
+	const totalWidthUnits = firstWidthUnits + secondWidthUnits;
+
+	return {
+		type: "split",
+		id: crypto.randomUUID(),
+		direction: "vertical",
+		ratio: firstWidthUnits / totalWidthUnits,
+		widthUnits: totalWidthUnits,
+		first: resizeLayoutWidth(first, firstWidthUnits),
+		second: resizeLayoutWidth(second, secondWidthUnits),
+	};
+}
+
+export function movePaneToColumnIndex(node: LayoutNode, sourcePaneId: string, columnIndex: number): LayoutNode {
+	const sourcePane = findPaneById(node, sourcePaneId);
+	if (!sourcePane) return node;
+
+	const layoutWithoutSource = removePane(node, sourcePaneId);
+	if (!layoutWithoutSource) return node;
+
+	const columns: LayoutNode[] = [];
+	collectRootColumns(layoutWithoutSource, columns);
+	const clampedIndex = Math.max(0, Math.min(columnIndex, columns.length));
+	const nextColumns = [...columns];
+	nextColumns.splice(clampedIndex, 0, createPaneNodeFromModel(sourcePane, APPENDED_PANE_WIDTH_UNITS));
+	return buildRootColumns(nextColumns);
 }
 
 export function closeTab(node: LayoutNode, paneId: string, tabId: string, workspacePath: string): LayoutNode {

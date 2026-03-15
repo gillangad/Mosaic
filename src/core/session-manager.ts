@@ -13,10 +13,12 @@ export class SessionManager {
 	private readonly shellLabels = new Map<string, string>();
 	private readonly sessionSnapshots = new Map<string, string>();
 	private readonly pendingSessionCreates = new Map<string, Promise<string>>();
+	private readonly closeRequestedWhilePending = new Set<string>();
 
 	constructor(private readonly backend: TerminalBackend) {}
 
 	async ensureSession(tabId: string, cwd: string): Promise<string> {
+		this.closeRequestedWhilePending.delete(tabId);
 		const existingSessionId = this.tabToSession.get(tabId);
 		if (existingSessionId) return existingSessionId;
 
@@ -26,9 +28,14 @@ export class SessionManager {
 		const createPromise = this.backend
 			.createSession({ cwd })
 			.then((session) => {
+				this.pendingSessionCreates.delete(tabId);
+				if (this.closeRequestedWhilePending.has(tabId)) {
+					this.closeRequestedWhilePending.delete(tabId);
+					void this.backend.close(session.id);
+					return session.id;
+				}
 				this.tabToSession.set(tabId, session.id);
 				this.shellLabels.set(tabId, normalizeShellLabel(session.shell));
-				this.pendingSessionCreates.delete(tabId);
 				return session.id;
 			})
 			.catch((error) => {
@@ -41,12 +48,14 @@ export class SessionManager {
 	}
 
 	closeSession(tabId: string): void {
+		this.closeRequestedWhilePending.add(tabId);
 		const sessionId = this.tabToSession.get(tabId);
 		this.pendingSessionCreates.delete(tabId);
 		this.tabToSession.delete(tabId);
 		this.shellLabels.delete(tabId);
 		this.sessionSnapshots.delete(tabId);
 		if (!sessionId) return;
+		this.closeRequestedWhilePending.delete(tabId);
 		void this.backend.close(sessionId);
 	}
 

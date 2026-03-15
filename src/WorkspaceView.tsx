@@ -3,10 +3,12 @@ import { TerminalPane } from "./components/TerminalPane";
 import {
 	addTabToPane,
 	closeTab,
+	COLUMN_INSERT_WIDTH_UNITS,
 	findFirstPaneId,
 	findPaneById,
 	getLayoutWidthUnits,
 	movePane,
+	movePaneToColumnIndex,
 	moveTabToPane,
 	removePane,
 	resizeVerticalSplitByDelta,
@@ -221,11 +223,24 @@ interface OverviewPaneRect {
 	height: number;
 }
 
-interface MinimapViewport {
-	left: number;
-	top: number;
+interface PaneDragState {
+	sourcePaneId: string;
+	startClientX: number;
+	startClientY: number;
+	clientX: number;
+	clientY: number;
+	moved: boolean;
+}
+
+interface PaneDropTarget {
+	targetPaneId: string;
+	position: PaneDropPosition;
+}
+
+interface OverviewColumnRect {
+	paneIds: string[];
+	x: number;
 	width: number;
-	height: number;
 }
 
 function collectOverviewPaneRects(node: LayoutNode, x: number, y: number, width: number, height: number, result: OverviewPaneRect[]) {
@@ -252,6 +267,26 @@ function collectOverviewPaneRects(node: LayoutNode, x: number, y: number, width:
 	collectOverviewPaneRects(node.second, x, y + firstHeight, width, height - firstHeight, result);
 }
 
+function collectOverviewColumnPaneIds(node: LayoutNode): string[] {
+	if (node.type === "pane") return [node.pane.id];
+	return [...collectOverviewColumnPaneIds(node.first), ...collectOverviewColumnPaneIds(node.second)];
+}
+
+function collectOverviewColumnRects(node: LayoutNode, x: number, width: number, result: OverviewColumnRect[]) {
+	if (node.type === "split" && node.direction === "vertical") {
+		const firstWidth = width * node.ratio;
+		collectOverviewColumnRects(node.first, x, firstWidth, result);
+		collectOverviewColumnRects(node.second, x + firstWidth, width - firstWidth, result);
+		return;
+	}
+
+	result.push({
+		paneIds: collectOverviewColumnPaneIds(node),
+		x,
+		width,
+	});
+}
+
 function resolveDropPosition(rect: OverviewPaneRect, worldX: number, worldY: number): PaneDropPosition {
 	const relativeX = (worldX - rect.x) / rect.width;
 	const relativeY = (worldY - rect.y) / rect.height;
@@ -268,6 +303,92 @@ function resolveDropPosition(rect: OverviewPaneRect, worldX: number, worldY: num
 	].sort((a, b) => a.value - b.value);
 
 	return distances[0].position;
+}
+
+function hitTestPaneRects(
+	paneRects: OverviewPaneRect[],
+	sourcePaneId: string,
+	worldX: number,
+	worldY: number,
+): PaneDropTarget | null {
+	const hit = paneRects.find((rect) => {
+		if (rect.pane.id === sourcePaneId) return false;
+		return worldX >= rect.x && worldX <= rect.x + rect.width && worldY >= rect.y && worldY <= rect.y + rect.height;
+	});
+	if (!hit) return null;
+	return { targetPaneId: hit.pane.id, position: resolveDropPosition(hit, worldX, worldY) };
+}
+
+const OVERVIEW_COLUMN_INSERT_THRESHOLD_PX = 20;
+const OVERVIEW_COLUMN_INSERT_HYSTERESIS_PX = 2;
+const OVERVIEW_COLUMN_INSERT_WIDTH_WORLD = COLUMN_INSERT_WIDTH_UNITS * 1100;
+
+interface UsePaneDragOptions {
+	paneRects: OverviewPaneRect[];
+	toWorld: (clientX: number, clientY: number) => { x: number; y: number } | null;
+	onMovePane: (sourcePaneId: string, targetPaneId: string, position: PaneDropPosition) => void;
+	onInsertColumn?: (sourcePaneId: string, columnIndex: number) => void;
+	resolveColumnInsert?: (clientX: number, clientY: number, currentIndex: number | null) => number | null;
+	onClickPane?: (paneId: string) => void;
+	moveThreshold?: number;
+}
+
+function usePaneDrag({ paneRects, toWorld, onMovePane, onInsertColumn, resolveColumnInsert, onClickPane, moveThreshold = 6 }: UsePaneDragOptions) {
+	const [dragState, setDragState] = useState<PaneDragState | null>(null);
+	const [hoverDrop, setHoverDrop] = useState<PaneDropTarget | null>(null);
+	const [columnInsertIndex, setColumnInsertIndex] = useState<number | null>(null);
+
+	const startDrag = useCallback((paneId: string, clientX: number, clientY: number) => {
+		setDragState({ sourcePaneId: paneId, startClientX: clientX, startClientY: clientY, clientX, clientY, moved: false });
+		setHoverDrop(null);
+		setColumnInsertIndex(null);
+	}, []);
+
+	useEffect(() => {
+		if (!dragState) return;
+
+		const handleMove = (event: MouseEvent) => {
+			const deltaX = event.clientX - dragState.startClientX;
+			const deltaY = event.clientY - dragState.startClientY;
+			const moved = dragState.moved || Math.hypot(deltaX, deltaY) > moveThreshold;
+			setDragState((current) => (current ? { ...current, clientX: event.clientX, clientY: event.clientY, moved } : current));
+
+			const nextColumnInsertIndex = moved && onInsertColumn && paneRects.length > 1
+				? resolveColumnInsert?.(event.clientX, event.clientY, columnInsertIndex) ?? null
+				: null;
+			setColumnInsertIndex(nextColumnInsertIndex);
+
+			const worldPoint = toWorld(event.clientX, event.clientY);
+			if (!worldPoint || nextColumnInsertIndex !== null) {
+				setHoverDrop(null);
+				return;
+			}
+
+			setHoverDrop(hitTestPaneRects(paneRects, dragState.sourcePaneId, worldPoint.x, worldPoint.y));
+		};
+
+		const handleUp = () => {
+			if (dragState.moved && columnInsertIndex !== null && onInsertColumn) {
+				onInsertColumn(dragState.sourcePaneId, columnInsertIndex);
+			} else if (dragState.moved && hoverDrop) {
+				onMovePane(dragState.sourcePaneId, hoverDrop.targetPaneId, hoverDrop.position);
+			} else if (!dragState.moved && onClickPane) {
+				onClickPane(dragState.sourcePaneId);
+			}
+			setDragState(null);
+			setHoverDrop(null);
+			setColumnInsertIndex(null);
+		};
+
+		window.addEventListener("mousemove", handleMove);
+		window.addEventListener("mouseup", handleUp);
+		return () => {
+			window.removeEventListener("mousemove", handleMove);
+			window.removeEventListener("mouseup", handleUp);
+		};
+	}, [columnInsertIndex, dragState, hoverDrop, moveThreshold, onClickPane, onInsertColumn, onMovePane, paneRects, resolveColumnInsert, toWorld]);
+
+	return { dragState, hoverDrop, columnInsertIndex, startDrag };
 }
 
 function stripAnsi(value: string) {
@@ -289,24 +410,16 @@ interface OverviewCanvasProps {
 	focusedPaneId?: string;
 	onFocusPane: (paneId: string) => void;
 	onMovePane: (sourcePaneId: string, targetPaneId: string, position: PaneDropPosition) => void;
+	onInsertColumn: (sourcePaneId: string, columnIndex: number) => void;
 	onExitOverview: () => void;
 }
 
-function OverviewCanvas({ layout, focusedPaneId, onFocusPane, onMovePane, onExitOverview }: OverviewCanvasProps) {
+function OverviewCanvas({ layout, focusedPaneId, onFocusPane, onMovePane, onInsertColumn, onExitOverview }: OverviewCanvasProps) {
 	const sessionManager = useSessionManager();
 	const stageRef = useRef<HTMLDivElement | null>(null);
 	const [viewport, setViewport] = useState({ width: 1, height: 1 });
 	const [camera, setCamera] = useState({ x: 0, y: 0, scale: 1 });
 	const [panState, setPanState] = useState<null | { startClientX: number; startClientY: number; originX: number; originY: number }>(null);
-	const [dragState, setDragState] = useState<null | {
-		sourcePaneId: string;
-		startClientX: number;
-		startClientY: number;
-		clientX: number;
-		clientY: number;
-		moved: boolean;
-	}>(null);
-	const [hoverDrop, setHoverDrop] = useState<null | { targetPaneId: string; position: PaneDropPosition }>(null);
 
 	const contentWidth = Math.max(getLayoutWidthUnits(layout), 1) * 1100;
 	const contentHeight = 760;
@@ -316,6 +429,20 @@ function OverviewCanvas({ layout, focusedPaneId, onFocusPane, onMovePane, onExit
 		collectOverviewPaneRects(layout, 0, 0, contentWidth, contentHeight, result);
 		return result;
 	}, [contentHeight, contentWidth, layout]);
+
+	const columnRects = useMemo(() => {
+		const result: OverviewColumnRect[] = [];
+		collectOverviewColumnRects(layout, 0, contentWidth, result);
+		return result;
+	}, [contentWidth, layout]);
+
+	const paneColumnIndexByPaneId = useMemo(() => {
+		const result = new Map<string, number>();
+		columnRects.forEach((columnRect, columnIndex) => {
+			columnRect.paneIds.forEach((paneId) => result.set(paneId, columnIndex));
+		});
+		return result;
+	}, [columnRects]);
 
 	useEffect(() => {
 		const stage = stageRef.current;
@@ -352,82 +479,78 @@ function OverviewCanvas({ layout, focusedPaneId, onFocusPane, onMovePane, onExit
 		[camera.x, camera.y, camera.scale],
 	);
 
+	const handleOverviewClick = useCallback(
+		(paneId: string) => {
+			onFocusPane(paneId);
+			onExitOverview();
+		},
+		[onExitOverview, onFocusPane],
+	);
+
+	const resolveOverviewColumnInsert = useCallback((clientX: number, _clientY: number, currentIndex: number | null) => {
+		if (columnRects.length === 0) return null;
+
+		const worldLeft = camera.x;
+		const worldRight = camera.x + contentWidth * camera.scale;
+		const interiorBoundaries = columnRects.slice(1).map((columnRect, index) => ({
+			columnIndex: index + 1,
+			x: camera.x + columnRect.x * camera.scale,
+		}));
+
+		if (currentIndex === 0) {
+			const leftRelease = worldLeft - (OVERVIEW_COLUMN_INSERT_THRESHOLD_PX - OVERVIEW_COLUMN_INSERT_HYSTERESIS_PX);
+			if (clientX <= leftRelease) return 0;
+		}
+		if (currentIndex === columnRects.length) {
+			const rightRelease = worldRight + (OVERVIEW_COLUMN_INSERT_THRESHOLD_PX - OVERVIEW_COLUMN_INSERT_HYSTERESIS_PX);
+			if (clientX >= rightRelease) return columnRects.length;
+		}
+		if (currentIndex !== null && currentIndex > 0 && currentIndex < columnRects.length) {
+			const currentBoundary = interiorBoundaries.find((boundary) => boundary.columnIndex === currentIndex);
+			if (currentBoundary && Math.abs(clientX - currentBoundary.x) <= OVERVIEW_COLUMN_INSERT_THRESHOLD_PX + OVERVIEW_COLUMN_INSERT_HYSTERESIS_PX) {
+				return currentIndex;
+			}
+		}
+
+		if (clientX <= worldLeft - OVERVIEW_COLUMN_INSERT_THRESHOLD_PX) return 0;
+		if (clientX >= worldRight + OVERVIEW_COLUMN_INSERT_THRESHOLD_PX) return columnRects.length;
+
+		let nearestBoundary: { columnIndex: number; distance: number } | null = null;
+		for (const boundary of interiorBoundaries) {
+			const distance = Math.abs(clientX - boundary.x);
+			if (!nearestBoundary || distance < nearestBoundary.distance) {
+				nearestBoundary = { columnIndex: boundary.columnIndex, distance };
+			}
+		}
+
+		if (nearestBoundary && nearestBoundary.distance <= OVERVIEW_COLUMN_INSERT_THRESHOLD_PX) {
+			return nearestBoundary.columnIndex;
+		}
+
+		return null;
+	}, [camera.x, camera.scale, columnRects, contentWidth]);
+
+	const { dragState, hoverDrop, columnInsertIndex, startDrag } = usePaneDrag({
+		paneRects,
+		toWorld,
+		onMovePane,
+		onInsertColumn,
+		resolveColumnInsert: resolveOverviewColumnInsert,
+		onClickPane: handleOverviewClick,
+	});
+
 	useEffect(() => {
-		if (!panState && !dragState) return;
+		if (!panState) return;
 
 		const handleMove = (event: MouseEvent) => {
-			if (panState) {
-				setCamera((current) => ({
-					...current,
-					x: panState.originX + (event.clientX - panState.startClientX),
-					y: panState.originY + (event.clientY - panState.startClientY),
-				}));
-				return;
-			}
-
-			if (!dragState) return;
-			const deltaX = event.clientX - dragState.startClientX;
-			const deltaY = event.clientY - dragState.startClientY;
-			const moved = dragState.moved || Math.hypot(deltaX, deltaY) > 6;
-			setDragState((current) => (current ? { ...current, clientX: event.clientX, clientY: event.clientY, moved } : current));
-
-			const stageRect = stageRef.current?.getBoundingClientRect();
-			if (stageRect) {
-				const edge = 64;
-				const speed = 14;
-				let panX = 0;
-				let panY = 0;
-				if (event.clientX < stageRect.left + edge) panX = speed;
-				else if (event.clientX > stageRect.right - edge) panX = -speed;
-				if (event.clientY < stageRect.top + edge) panY = speed;
-				else if (event.clientY > stageRect.bottom - edge) panY = -speed;
-				if (panX !== 0 || panY !== 0) {
-					setCamera((current) => ({
-						...current,
-						x: current.x + panX,
-						y: current.y + panY,
-					}));
-				}
-			}
-
-			const worldPoint = toWorld(event.clientX, event.clientY);
-			if (!worldPoint) return;
-
-			const hit = paneRects.find((paneRect) => {
-				if (paneRect.pane.id === dragState.sourcePaneId) return false;
-				return (
-					worldPoint.x >= paneRect.x &&
-					worldPoint.x <= paneRect.x + paneRect.width &&
-					worldPoint.y >= paneRect.y &&
-					worldPoint.y <= paneRect.y + paneRect.height
-				);
-			});
-
-			if (!hit) {
-				setHoverDrop(null);
-				return;
-			}
-
-			setHoverDrop({
-				targetPaneId: hit.pane.id,
-				position: resolveDropPosition(hit, worldPoint.x, worldPoint.y),
-			});
+			setCamera((current) => ({
+				...current,
+				x: panState.originX + (event.clientX - panState.startClientX),
+				y: panState.originY + (event.clientY - panState.startClientY),
+			}));
 		};
 
-		const handleUp = () => {
-			if (dragState) {
-				if (dragState.moved && hoverDrop) {
-					onMovePane(dragState.sourcePaneId, hoverDrop.targetPaneId, hoverDrop.position);
-				} else if (!dragState.moved) {
-					onFocusPane(dragState.sourcePaneId);
-					onExitOverview();
-				}
-			}
-
-			setPanState(null);
-			setDragState(null);
-			setHoverDrop(null);
-		};
+		const handleUp = () => setPanState(null);
 
 		window.addEventListener("mousemove", handleMove);
 		window.addEventListener("mouseup", handleUp);
@@ -435,7 +558,50 @@ function OverviewCanvas({ layout, focusedPaneId, onFocusPane, onMovePane, onExit
 			window.removeEventListener("mousemove", handleMove);
 			window.removeEventListener("mouseup", handleUp);
 		};
-	}, [dragState, hoverDrop, onExitOverview, onFocusPane, onMovePane, panState, paneRects, toWorld]);
+	}, [panState]);
+
+	const showOverviewColumnTargets = Boolean(dragState?.moved && columnRects.length > 0);
+	const renderedPaneRects = columnInsertIndex === null
+		? paneRects
+		: paneRects.map((paneRect) => {
+			const columnIndex = paneColumnIndexByPaneId.get(paneRect.pane.id) ?? 0;
+			return columnIndex < columnInsertIndex ? paneRect : { ...paneRect, x: paneRect.x + OVERVIEW_COLUMN_INSERT_WIDTH_WORLD };
+		});
+	const draggedPane = dragState ? paneRects.find((rect) => rect.pane.id === dragState.sourcePaneId)?.pane ?? null : null;
+	const draggedActiveTab = draggedPane ? draggedPane.tabs.find((tab) => tab.id === draggedPane.activeTabId) ?? draggedPane.tabs[0] : null;
+	const draggedPreview = draggedActiveTab ? buildOverviewPreview(sessionManager.getSnapshot(draggedActiveTab.id) ?? "") : "No output yet";
+	const edgeGuideTop = camera.y;
+	const edgeGuideHeight = contentHeight * camera.scale;
+	const worldLeft = camera.x;
+	const worldRight = camera.x + contentWidth * camera.scale;
+	const columnInsertPreview = showOverviewColumnTargets && columnInsertIndex !== null && draggedPane
+		? {
+			label:
+				columnInsertIndex === 0
+					? "New left column"
+					: columnInsertIndex === columnRects.length
+						? "New right column"
+						: "Insert column",
+			title: draggedActiveTab?.title ?? "terminal",
+			tabCount: draggedPane.tabs.length,
+			preview: draggedPreview,
+			lineLeft:
+				columnInsertIndex === 0
+					? worldLeft
+					: columnInsertIndex === columnRects.length
+						? worldRight
+						: camera.x + columnRects[columnInsertIndex].x * camera.scale,
+			ghostLeft:
+				columnInsertIndex === 0
+					? worldLeft
+					: columnInsertIndex === columnRects.length
+						? worldRight
+						: camera.x + columnRects[columnInsertIndex].x * camera.scale,
+			ghostWidth: OVERVIEW_COLUMN_INSERT_WIDTH_WORLD * camera.scale,
+			top: camera.y,
+			height: contentHeight * camera.scale,
+		}
+		: null;
 
 	return (
 		<div
@@ -472,7 +638,31 @@ function OverviewCanvas({ layout, focusedPaneId, onFocusPane, onMovePane, onExit
 				});
 			}}
 		>
-			<div className="overview-hint">Drag panes. Drop on edges to split, center to swap. Scroll to zoom.</div>
+			<div className="overview-hint">Drag panes. Drop on pane edges to split, center to swap, drag between columns to insert, or drag past the layout edge to make a new outer column. Scroll to zoom.</div>
+			{showOverviewColumnTargets ? (
+				<>
+					<div
+						className={`overview-edge-drop-zone left ${columnInsertIndex === 0 ? "active" : ""}`}
+						style={{
+							left: `${worldLeft - OVERVIEW_COLUMN_INSERT_THRESHOLD_PX}px`,
+							top: `${edgeGuideTop}px`,
+							height: `${edgeGuideHeight}px`,
+						}}
+					>
+						<div className="overview-edge-drop-zone-label">New left column</div>
+					</div>
+					<div
+						className={`overview-edge-drop-zone right ${columnInsertIndex === columnRects.length ? "active" : ""}`}
+						style={{
+							left: `${worldRight}px`,
+							top: `${edgeGuideTop}px`,
+							height: `${edgeGuideHeight}px`,
+						}}
+					>
+						<div className="overview-edge-drop-zone-label">New right column</div>
+					</div>
+				</>
+			) : null}
 			<div
 				className="overview-world"
 				style={{
@@ -481,7 +671,7 @@ function OverviewCanvas({ layout, focusedPaneId, onFocusPane, onMovePane, onExit
 					transform: `translate(${camera.x}px, ${camera.y}px) scale(${camera.scale})`,
 				}}
 			>
-				{paneRects.map((paneRect) => {
+				{renderedPaneRects.map((paneRect) => {
 					const isSource = dragState?.sourcePaneId === paneRect.pane.id;
 					const dropPosition = hoverDrop?.targetPaneId === paneRect.pane.id ? hoverDrop.position : null;
 					const activeTab = paneRect.pane.tabs.find((tab) => tab.id === paneRect.pane.activeTabId) ?? paneRect.pane.tabs[0];
@@ -500,14 +690,7 @@ function OverviewCanvas({ layout, focusedPaneId, onFocusPane, onMovePane, onExit
 							onMouseDown={(event) => {
 								if (event.button !== 0) return;
 								event.stopPropagation();
-								setDragState({
-									sourcePaneId: paneRect.pane.id,
-									startClientX: event.clientX,
-									startClientY: event.clientY,
-									clientX: event.clientX,
-									clientY: event.clientY,
-									moved: false,
-								});
+								startDrag(paneRect.pane.id, event.clientX, event.clientY);
 							}}
 						>
 							<div className="overview-pane-header">{activeTab?.title ?? "terminal"}</div>
@@ -518,6 +701,32 @@ function OverviewCanvas({ layout, focusedPaneId, onFocusPane, onMovePane, onExit
 					);
 				})}
 			</div>
+			{columnInsertPreview ? (
+				<>
+					<div
+						className="overview-detach-edge-line"
+						style={{
+							left: `${columnInsertPreview.lineLeft}px`,
+							top: `${columnInsertPreview.top}px`,
+							height: `${columnInsertPreview.height}px`,
+						}}
+					/>
+					<div
+						className="overview-detach-ghost"
+						style={{
+							left: `${columnInsertPreview.ghostLeft}px`,
+							top: `${columnInsertPreview.top}px`,
+							width: `${columnInsertPreview.ghostWidth}px`,
+							height: `${columnInsertPreview.height}px`,
+						}}
+					>
+						<div className="overview-detach-ghost-pill">{columnInsertPreview.label}</div>
+						<div className="overview-detach-ghost-title">{columnInsertPreview.title}</div>
+						<div className="overview-detach-ghost-meta">{columnInsertPreview.tabCount} tab{columnInsertPreview.tabCount === 1 ? "" : "s"}</div>
+						<pre className="overview-detach-ghost-preview">{columnInsertPreview.preview}</pre>
+					</div>
+				</>
+			) : null}
 		</div>
 	);
 }
@@ -530,6 +739,8 @@ interface WorkspaceViewProps {
 	overviewOpen: boolean;
 	focusedPaneId?: string;
 	onExitOverview: () => void;
+	onOpenOverview: () => void;
+	onAddPane: () => void;
 	onFocusPane: (paneId: string) => void;
 	onSwapPanes: (sourcePaneId: string, targetPaneId: string) => void;
 	onSplitPane: (paneId: string, direction: SplitDirection) => void;
@@ -544,6 +755,8 @@ export function WorkspaceView({
 	overviewOpen,
 	focusedPaneId,
 	onExitOverview,
+	onOpenOverview,
+	onAddPane,
 	onFocusPane,
 	onSwapPanes,
 	onSplitPane,
@@ -554,12 +767,7 @@ export function WorkspaceView({
 	const paneElementsRef = useRef(new Map<string, HTMLDivElement>());
 	const [zoomedPaneId, setZoomedPaneId] = useState<string | null>(null);
 	const [middlePanning, setMiddlePanning] = useState(false);
-	const [minimapViewport, setMinimapViewport] = useState<MinimapViewport>({
-		left: 0,
-		top: 0,
-		width: 100,
-		height: 100,
-	});
+
 	const middlePanStateRef = useRef<null | {
 		startClientX: number;
 		startClientY: number;
@@ -656,6 +864,19 @@ export function WorkspaceView({
 		[onUpdateLayout, sessionManager, workspace.layout],
 	);
 
+	const handleMovePaneToColumn = useCallback(
+		(paneId: string, columnIndex: number) => {
+			const columns: OverviewColumnRect[] = [];
+			collectOverviewColumnRects(workspace.layout, 0, Math.max(getLayoutWidthUnits(workspace.layout), 1) * 1100, columns);
+			const sourceColumnIndex = columns.findIndex((columnRect) => columnRect.paneIds.includes(paneId));
+			const sourceColumnPaneCount = sourceColumnIndex >= 0 ? columns[sourceColumnIndex]?.paneIds.length ?? 0 : 0;
+			const normalizedColumnIndex = sourceColumnPaneCount === 1 && sourceColumnIndex >= 0 && columnIndex > sourceColumnIndex ? columnIndex - 1 : columnIndex;
+			onUpdateLayout(movePaneToColumnIndex(workspace.layout, paneId, normalizedColumnIndex));
+			onFocusPane(paneId);
+		},
+		[onFocusPane, onUpdateLayout, workspace.layout],
+	);
+
 	const handleMoveTab = useCallback(
 		(sourcePaneId: string, tabId: string, targetPaneId: string) => {
 			onUpdateLayout(moveTabToPane(workspace.layout, sourcePaneId, tabId, targetPaneId, workspace.path));
@@ -703,44 +924,6 @@ export function WorkspaceView({
 		return rects;
 	}, [workspace.layout]);
 
-	useEffect(() => {
-		if (overviewOpen) return;
-		const container = layoutRootRef.current;
-		if (!container) return;
-
-		const updateViewport = () => {
-			const scrollWidth = Math.max(container.scrollWidth, 1);
-			const scrollHeight = Math.max(container.scrollHeight, 1);
-			const next: MinimapViewport = {
-				left: clamp((container.scrollLeft / scrollWidth) * 100, 0, 100),
-				top: clamp((container.scrollTop / scrollHeight) * 100, 0, 100),
-				width: clamp((container.clientWidth / scrollWidth) * 100, 4, 100),
-				height: clamp((container.clientHeight / scrollHeight) * 100, 4, 100),
-			};
-
-			setMinimapViewport((current) => {
-				const changed =
-					Math.abs(current.left - next.left) > 0.1 ||
-					Math.abs(current.top - next.top) > 0.1 ||
-					Math.abs(current.width - next.width) > 0.1 ||
-					Math.abs(current.height - next.height) > 0.1;
-				return changed ? next : current;
-			});
-		};
-
-		updateViewport();
-		container.addEventListener("scroll", updateViewport, { passive: true });
-		const observer = new ResizeObserver(updateViewport);
-		observer.observe(container);
-		const canvas = container.querySelector(".layout-canvas");
-		if (canvas instanceof HTMLElement) observer.observe(canvas);
-
-		return () => {
-			container.removeEventListener("scroll", updateViewport);
-			observer.disconnect();
-		};
-	}, [overviewOpen, workspace.layout, zoomedPaneId]);
-
 	const focusPaneFromMap = useCallback(
 		(paneId: string) => {
 			onFocusPane(paneId);
@@ -748,6 +931,10 @@ export function WorkspaceView({
 			const paneElement = paneElementsRef.current.get(paneId);
 			if (!container || !paneElement) return;
 			revealFocusedPane(container, paneElement, "center");
+			requestAnimationFrame(() => {
+				const textarea = paneElement.querySelector<HTMLTextAreaElement>(".xterm-helper-textarea");
+				textarea?.focus();
+			});
 		},
 		[onFocusPane],
 	);
@@ -786,6 +973,7 @@ export function WorkspaceView({
 						focusedPaneId={focusedPaneId}
 						onFocusPane={onFocusPane}
 						onMovePane={handleOverviewMovePane}
+						onInsertColumn={handleMovePaneToColumn}
 						onExitOverview={onExitOverview}
 					/>
 				) : (
@@ -847,40 +1035,53 @@ export function WorkspaceView({
 					</div>
 				)}
 			</div>
-			{showMinimap ? (
-				<div className="pane-minimap" role="navigation" aria-label="Pane minimap">
-					<div className="pane-minimap-track">
-						{minimapPaneRects.map((rect) => {
-							const activeTab = rect.pane.tabs.find((tab) => tab.id === rect.pane.activeTabId) ?? rect.pane.tabs[0];
-							return (
-								<button
-									key={rect.pane.id}
-									type="button"
-									className={`pane-minimap-pane ${focusedPaneId === rect.pane.id ? "active" : ""}`}
-									style={{
-										left: `${rect.x}%`,
-										top: `${rect.y}%`,
-										width: `${rect.width}%`,
-										height: `${rect.height}%`,
-									}}
-									onClick={() => focusPaneFromMap(rect.pane.id)}
-									aria-label={`Focus pane ${activeTab?.title ?? "terminal"}`}
-									title={activeTab?.title ?? "terminal"}
-								/>
-							);
-						})}
-						<div
-							className="pane-minimap-viewport"
-							style={{
-								left: `${minimapViewport.left}%`,
-								top: `${minimapViewport.top}%`,
-								width: `${minimapViewport.width}%`,
-								height: `${minimapViewport.height}%`,
-							}}
-						/>
-					</div>
+			<div className={`workspace-corner-stack ${showMinimap ? "with-minimap" : ""}`}>
+				<div className="workspace-corner-controls">
+					<button
+						type="button"
+						className={`icon-button ${overviewOpen ? "active" : ""}`}
+						onClick={overviewOpen ? onExitOverview : onOpenOverview}
+						aria-label={overviewOpen ? "Exit overview" : "Open overview"}
+					>
+						⊞
+					</button>
+					<button type="button" className="new-pane-button workspace-corner-new-pane" onClick={onAddPane} aria-label="Add a new pane">
+						<span className="new-pane-plus">+</span> New Pane
+					</button>
 				</div>
-			) : null}
+				{showMinimap ? (
+					<div className="pane-minimap" role="navigation" aria-label="Pane minimap" onDoubleClick={onOpenOverview}>
+						<div className="pane-minimap-track">
+							{minimapPaneRects.map((rect) => {
+								const activeTab = rect.pane.tabs.find((tab) => tab.id === rect.pane.activeTabId) ?? rect.pane.tabs[0];
+								return (
+									<div
+										key={rect.pane.id}
+										className={`pane-minimap-pane ${focusedPaneId === rect.pane.id ? "active" : ""}`}
+										style={{
+											left: `${rect.x}%`,
+											top: `${rect.y}%`,
+											width: `${rect.width}%`,
+											height: `${rect.height}%`,
+										}}
+										onClick={() => focusPaneFromMap(rect.pane.id)}
+										onKeyDown={(event) => {
+											if (event.key === "Enter" || event.key === " ") {
+												event.preventDefault();
+												focusPaneFromMap(rect.pane.id);
+											}
+										}}
+										role="button"
+										tabIndex={0}
+										aria-label={`Focus pane ${activeTab?.title ?? "terminal"}`}
+										title={activeTab?.title ?? "terminal"}
+									/>
+								);
+							})}
+						</div>
+					</div>
+				) : null}
+			</div>
 		</div>
 	);
 }

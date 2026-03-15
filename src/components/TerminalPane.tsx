@@ -14,7 +14,7 @@ interface TerminalTabSurfaceProps {
 	theme: MosaicTheme;
 	cwd: string;
 	isActive: boolean;
-	onUpdateTabMeta: (patch: Partial<Pick<TerminalTabModel, "status" | "shellLabel" | "message">>) => void;
+	onUpdateTabMeta: (patch: Partial<Pick<TerminalTabModel, "status" | "shellLabel" | "message" | "title">>) => void;
 }
 
 interface TerminalPaneProps {
@@ -33,7 +33,7 @@ interface TerminalPaneProps {
 	onCloseTab: (tabId: string) => void;
 	onMoveTab: (sourcePaneId: string, tabId: string, targetPaneId: string) => void;
 	onToggleZoom: () => void;
-	onUpdateTabMeta: (tabId: string, patch: Partial<Pick<TerminalTabModel, "status" | "shellLabel" | "message">>) => void;
+	onUpdateTabMeta: (tabId: string, patch: Partial<Pick<TerminalTabModel, "status" | "shellLabel" | "message" | "title">>) => void;
 }
 
 function buildTerminalTheme(theme: MosaicTheme, accent: string) {
@@ -108,6 +108,7 @@ function TerminalTabSurface({ tab, accent, theme, cwd, isActive, onUpdateTabMeta
 		let fitAddon: FitAddon;
 		let serializeAddon: SerializeAddon;
 		let inputDisposable: { dispose: () => void } | null = null;
+		let titleDisposable: { dispose: () => void } | null = null;
 		let snapshotIntervalId: number | null = null;
 
 		try {
@@ -200,6 +201,10 @@ function TerminalTabSurface({ tab, accent, theme, cwd, isActive, onUpdateTabMeta
 					void backend.write(sessionRef.current, data);
 				});
 
+				titleDisposable = terminal.onTitleChange((nextTitle) => {
+					if (nextTitle) updateTabMetaRef.current({ title: nextTitle });
+				});
+
 				resizeObserverRef.current = new ResizeObserver(resizeTerminal);
 				if (terminalRef.current) resizeObserverRef.current.observe(terminalRef.current);
 
@@ -225,6 +230,7 @@ function TerminalTabSurface({ tab, accent, theme, cwd, isActive, onUpdateTabMeta
 			unsubscribeRef.current?.();
 			unsubscribeRef.current = null;
 			inputDisposable?.dispose();
+			titleDisposable?.dispose();
 			if (serializeAddonRef.current) {
 				sessionManager.setSnapshot(tab.id, serializeAddonRef.current.serialize());
 			}
@@ -491,7 +497,7 @@ export function TerminalPane({
 				</div>
 
 				<div className="pane-actions">
-					{zoomed ? <span className="pane-zoom-pill">Focus mode</span> : null}
+					{zoomed ? <span className="pane-zoom-pill">Focus</span> : null}
 					<div className="pane-action-slot" data-tooltip={zoomed ? "Exit focus mode" : "Focus this pane"}>
 						<button
 							type="button"

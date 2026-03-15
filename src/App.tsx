@@ -231,7 +231,8 @@ function WorkspaceTabItem({
 							{getWorkspaceTabLabel(workspace)}
 						</span>
 					)}
-					{workspace.git.isRepo ? <span className="workspace-tab-meta">{workspace.git.summary}</span> : null}
+					<span className="workspace-tab-meta">{workspace.path}</span>
+					{workspace.git.isRepo && workspace.git.branch ? <span className="workspace-tab-meta">{workspace.git.branch}</span> : null}
 				</span>
 			</button>
 			<button
@@ -355,13 +356,6 @@ export function App() {
 
 	const openWorkspaceSelection = useCallback((selection: WorkspaceSelection) => {
 		setWorkspaces((current) => {
-			const normalizedPath = normalizeWorkspacePath(selection.path);
-			const existingIndex = current.findIndex((workspace) => normalizeWorkspacePath(workspace.path) === normalizedPath);
-			if (existingIndex >= 0) {
-				setActiveIndex(existingIndex);
-				return current;
-			}
-
 			const layout = createPaneNode(selection.path);
 			const next = [
 				...current,
@@ -609,11 +603,11 @@ export function App() {
 		const panelWidth = panelRect?.width ?? 260;
 		const panelHeight = panelRect?.height ?? 380;
 
-		let left = tabOrientation === "horizontal" ? 8 : buttonRect ? buttonRect.left : margin;
+		let left = buttonRect ? buttonRect.left : margin;
 		left = Math.min(Math.max(left, margin), Math.max(margin, window.innerWidth - panelWidth - margin));
 
-		let top = tabOrientation === "horizontal" ? 44 : buttonRect ? buttonRect.bottom + gap : 44;
-		if (tabOrientation !== "horizontal" && buttonRect) {
+		let top = buttonRect ? buttonRect.bottom + gap : 44;
+		if (buttonRect) {
 			const fitsBelow = buttonRect.bottom + gap + panelHeight <= window.innerHeight - margin;
 			const aboveTop = buttonRect.top - gap - panelHeight;
 			if (!fitsBelow && aboveTop >= margin) {
@@ -622,8 +616,7 @@ export function App() {
 		}
 		top = Math.min(Math.max(top, margin), Math.max(margin, window.innerHeight - panelHeight - margin));
 
-		const minPanelHeight = tabOrientation === "horizontal" ? 260 : 180;
-		const maxHeight = Math.max(minPanelHeight, window.innerHeight - top - margin);
+		const maxHeight = Math.max(320, window.innerHeight - top - margin);
 		setSettingsPanelPosition((current) => {
 			if (Math.abs(current.left - left) < 0.5 && Math.abs(current.top - top) < 0.5 && Math.abs(current.maxHeight - maxHeight) < 0.5) {
 				return current;
@@ -888,8 +881,7 @@ export function App() {
 		toggleOverview,
 	]);
 
-	const project = activeWorkspace;
-	const activeWorkspaceAccent = project ? getWorkspaceAccent(currentTheme, activeIndex) : currentTheme.accents.product;
+	const activeWorkspaceAccent = activeWorkspace ? getWorkspaceAccent(currentTheme, activeIndex) : currentTheme.accents.product;
 	const appShellStyle = useMemo(
 		() => ({
 			...shellStyle,
@@ -1060,28 +1052,6 @@ export function App() {
 						</button>
 					</div>
 					{workspaceTabs}
-
-					<div className="topbar-controls">
-						<button
-							type="button"
-							className={`icon-button ${overviewOpen ? "active" : ""}`}
-							onClick={toggleOverview}
-							disabled={!project}
-							aria-label="Toggle overview"
-						>
-							⊞
-						</button>
-						<button
-							type="button"
-							className="new-pane-button"
-							style={{ ["--workspace-accent" as string]: activeWorkspaceAccent }}
-							onClick={addPaneToActiveWorkspace}
-							disabled={!project}
-							aria-label="Add a new pane"
-						>
-							<span className="new-pane-plus">+</span> New Pane
-						</button>
-					</div>
 				</header>
 			) : null}
 
@@ -1110,27 +1080,6 @@ export function App() {
 							<span className="rail-label">Workspaces</span>
 						</div>
 						<div className="workspace-rail-body">{workspaceTabs}</div>
-						<div className="workspace-rail-footer">
-							<button
-								type="button"
-								className="new-pane-button rail-new-pane"
-								style={{ ["--workspace-accent" as string]: activeWorkspaceAccent }}
-								onClick={addPaneToActiveWorkspace}
-								disabled={!project}
-								aria-label="Add a new pane"
-							>
-								<span className="new-pane-plus">+</span> New Pane
-							</button>
-							<button
-								type="button"
-								className={`icon-button ${overviewOpen ? "active" : ""}`}
-								onClick={toggleOverview}
-								disabled={!project}
-								aria-label="Toggle overview"
-							>
-								⊞
-							</button>
-						</div>
 					</aside>
 				) : null}
 				<div className="workspace-stage">
@@ -1170,6 +1119,8 @@ export function App() {
 									focusMode="center"
 									overviewOpen={overviewOpen}
 									onExitOverview={() => setOverviewOpen(false)}
+									onOpenOverview={() => setOverviewOpen(true)}
+									onAddPane={addPaneToActiveWorkspace}
 									focusedPaneId={activeWorkspace.focusedPaneId}
 									onFocusPane={(paneId) => focusPane(activeWorkspace.id, paneId)}
 									onSwapPanes={(sourcePaneId, targetPaneId) =>

@@ -1,4 +1,10 @@
 const { contextBridge, ipcRenderer } = require("electron");
+const { randomUUID } = require("node:crypto");
+
+function createSubscriptionId() {
+	if (typeof randomUUID === "function") return randomUUID();
+	return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
 
 contextBridge.exposeInMainWorld("mosaic", {
 	createTerminal: (options) => ipcRenderer.invoke("terminal:create", options),
@@ -9,6 +15,7 @@ contextBridge.exposeInMainWorld("mosaic", {
 	inspectWorkspace: (directoryPath) => ipcRenderer.invoke("workspace:inspect", directoryPath),
 	updateTitleBarOverlay: (payload) => ipcRenderer.invoke("window:updateTitleBarOverlay", payload),
 	subscribeTerminal: (id, handlers) => {
+		const subscriptionId = createSubscriptionId();
 		const dataChannel = `terminal:data:${id}`;
 		const exitChannel = `terminal:exit:${id}`;
 		const dataListener = (_event, data) => handlers.onData(data);
@@ -16,10 +23,10 @@ contextBridge.exposeInMainWorld("mosaic", {
 
 		ipcRenderer.on(dataChannel, dataListener);
 		ipcRenderer.on(exitChannel, exitListener);
-		ipcRenderer.send("terminal:subscribe", id);
+		ipcRenderer.send("terminal:subscribe", { id, subscriptionId });
 
 		return () => {
-			ipcRenderer.send(`terminal:unsubscribe:${id}`);
+			ipcRenderer.send("terminal:unsubscribe", { id, subscriptionId });
 			ipcRenderer.removeListener(dataChannel, dataListener);
 			ipcRenderer.removeListener(exitChannel, exitListener);
 		};

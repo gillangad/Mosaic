@@ -35,5 +35,56 @@ Compact source control panel built into a pane. All operations run through the `
 ## 4. File Viewer Pane
 Read-only code or log viewer. Reads files from the workspace directory via IPC. Needs syntax highlighting and large-file scrolling.
 
-## 5. Image / Media Preview Pane
+## 5. File Tree
+Workspace file explorer — makes Mosaic feel like an IDE.
+
+**Placement:** default as a fixed sidebar on the left of each workspace (like VS Code). Can also be popped out into a standalone pane for flexible layouts.
+
+**How it works:**
+- Main process reads the workspace directory via `fs.readdir` with lazy loading — only expands folders when clicked
+- Watches expanded directories with `fs.watch` so the tree updates live on file changes
+- Click a file → opens it in a File Viewer pane
+- Right-click context menu → new file, new folder, rename, delete, copy path
+- Drag a file onto a terminal pane → pastes the file path into the terminal
+- Search/filter bar at the top to find files by name
+
+**Performance:** lazy expansion means no full tree scan upfront. Respects `.gitignore` by default. Skips `node_modules`, `.git`, `dist` unless explicitly expanded.
+
+**Cross-platform:** `fs.readdir` and `fs.watch` work on Windows, macOS, and Linux. Uses `path.join` for path separators — no platform-specific code.
+
+**Design:** collapsible tree with indent guides, file type icons (folder, JS, TS, JSON, MD, image, etc.), toggle for hidden files. Dark, compact, fits Mosaic's visual style.
+
+## 6. Image / Media Preview Pane
 Displays images and media assets from the workspace directory. Simple `<img>` render with zoom/pan. Lightweight, no heavy dependencies.
+
+---
+
+# OSS Integrations
+
+Open source tools that can be embedded into Mosaic panes.
+
+## Easy
+
+**Excalidraw** — hand-drawn style whiteboard (shapes, arrows, freeform drawing). Single React component, save as JSON. MIT. `@excalidraw/excalidraw`
+
+**tldraw** — polished whiteboard/canvas tool. Smoother and more modern than Excalidraw. Single React component, save as JSON. MIT. `tldraw`
+
+**Mermaid** — renders diagrams (flowcharts, sequence, ERD, Gantt) from plain text. Tiny footprint, just outputs SVG. MIT. `mermaid`
+
+**BlockNote** — Notion-like block editor with slash commands, drag-and-drop blocks, tables, toggles. Best upgrade for the Notes pane. Single React component, save as JSON. MIT. `@blocknote/react`
+
+**CodeMirror** — lightweight code editor with syntax highlighting. Modular — pick only what you need. Smaller and faster than Monaco. Good for config files and quick edits. MIT. `@codemirror/view`
+
+## Medium
+
+**Monaco Editor** — the actual VS Code editor engine. Full syntax highlighting, IntelliSense, autocomplete, minimap. Turns File Viewer into a real code editor. Heavy (~5MB), needs language worker config. MIT. `@monaco-editor/react`
+
+**Milkdown** — WYSIWYG Markdown editor with a plugin system. More Markdown-native than BlockNote — notes are real `.md` files on disk. More setup but more customizable. MIT. `@milkdown/kit`
+
+## Hard (webview or background service required)
+
+**Hoppscotch** — open source Postman alternative. API testing with collections and environments. Full standalone app — embed via `<webview>` or rebuild a simplified version. MIT.
+
+**Directus** — database GUI and headless CMS. Browse tables, run queries, manage data. Runs as a separate server — embed via `<webview>`. Overkill for a simple DB pane; better to build a lightweight query runner instead. GPL.
+
+**Grafana Panels** — embeddable monitoring charts (CPU, memory, request rates). Needs a running Grafana instance and data source. Only useful if the user already runs Grafana. Power-user integration. AGPL.
