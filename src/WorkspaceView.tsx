@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { TerminalPane } from "./components/TerminalPane";
 import {
+	addBrowserTabToPane,
 	addTabToPane,
 	closeTab,
 	COLUMN_INSERT_WIDTH_UNITS,
+	enforcePaneWidthCap,
 	WIDTH_UNIT_BASE,
 	findFirstPaneId,
 	findPaneById,
@@ -14,6 +16,8 @@ import {
 	removePane,
 	resizeVerticalSplitByDelta,
 	setActiveTab,
+	splitNode,
+	swapPanes,
 	updateSplitRatio,
 	updateTabMeta,
 	type PaneDropPosition,
@@ -38,10 +42,13 @@ interface LayoutViewProps {
 	canMovePaneToNewColumn: (paneId: string) => boolean;
 	onClosePane: (paneId: string) => void;
 	onAddTab: (paneId: string) => void;
+	onAddBrowserTab: (paneId: string) => void;
 	onSelectTab: (paneId: string, tabId: string) => void;
 	onCloseTab: (paneId: string, tabId: string) => void;
 	onMoveTab: (sourcePaneId: string, tabId: string, targetPaneId: string) => void;
+	onDropTabToPane: (sourcePaneId: string, tabId: string, targetPaneId: string, position: PaneDropPosition) => void;
 	onTogglePaneZoom: (paneId: string) => void;
+	onBeginPaneShiftDrag: (paneId: string, clientX: number, clientY: number) => void;
 	onResizeHorizontalSplit: (splitId: string, ratio: number) => void;
 	onResizeVerticalSplitBranch: (splitId: string, branch: "first" | "second", deltaRatio: number) => void;
 	onRegisterPaneElement: (paneId: string, element: HTMLDivElement | null) => void;
@@ -67,10 +74,13 @@ function LayoutView({
 	canMovePaneToNewColumn,
 	onClosePane,
 	onAddTab,
+	onAddBrowserTab,
 	onSelectTab,
 	onCloseTab,
 	onMoveTab,
+	onDropTabToPane,
 	onTogglePaneZoom,
+	onBeginPaneShiftDrag,
 	onResizeHorizontalSplit,
 	onResizeVerticalSplitBranch,
 	onRegisterPaneElement,
@@ -95,10 +105,13 @@ function LayoutView({
 					onSplitHorizontal={() => onSplit(node.pane.id, "horizontal")}
 					onClose={() => onClosePane(node.pane.id)}
 					onAddTab={() => onAddTab(node.pane.id)}
+					onAddBrowserTab={() => onAddBrowserTab(node.pane.id)}
 					onSelectTab={(tabId) => onSelectTab(node.pane.id, tabId)}
 					onCloseTab={(tabId) => onCloseTab(node.pane.id, tabId)}
 					onMoveTab={onMoveTab}
+					onDropTabToPane={(sourcePaneId, tabId, position) => onDropTabToPane(sourcePaneId, tabId, node.pane.id, position)}
 					onToggleZoom={() => onTogglePaneZoom(node.pane.id)}
+					onBeginShiftDrag={(clientX, clientY) => onBeginPaneShiftDrag(node.pane.id, clientX, clientY)}
 					onUpdateTabMeta={(tabId, patch) => onUpdateTabMeta(node.pane.id, tabId, patch)}
 					onOpenFile={(filePath) => onOpenFile(filePath, node.pane.id)}
 					onUpdateTab={(tabId, updater) => onUpdateTab(node.pane.id, tabId, updater)}
@@ -172,10 +185,13 @@ function LayoutView({
 					canMovePaneToNewColumn={canMovePaneToNewColumn}
 					onClosePane={onClosePane}
 					onAddTab={onAddTab}
+					onAddBrowserTab={onAddBrowserTab}
 					onSelectTab={onSelectTab}
 					onCloseTab={onCloseTab}
 					onMoveTab={onMoveTab}
+					onDropTabToPane={onDropTabToPane}
 					onTogglePaneZoom={onTogglePaneZoom}
+					onBeginPaneShiftDrag={onBeginPaneShiftDrag}
 					onResizeHorizontalSplit={onResizeHorizontalSplit}
 					onResizeVerticalSplitBranch={onResizeVerticalSplitBranch}
 					onRegisterPaneElement={onRegisterPaneElement}
@@ -227,10 +243,13 @@ function LayoutView({
 					canMovePaneToNewColumn={canMovePaneToNewColumn}
 					onClosePane={onClosePane}
 					onAddTab={onAddTab}
+					onAddBrowserTab={onAddBrowserTab}
 					onSelectTab={onSelectTab}
 					onCloseTab={onCloseTab}
 					onMoveTab={onMoveTab}
+					onDropTabToPane={onDropTabToPane}
 					onTogglePaneZoom={onTogglePaneZoom}
+					onBeginPaneShiftDrag={onBeginPaneShiftDrag}
 					onResizeHorizontalSplit={onResizeHorizontalSplit}
 					onResizeVerticalSplitBranch={onResizeVerticalSplitBranch}
 					onRegisterPaneElement={onRegisterPaneElement}
@@ -338,6 +357,16 @@ function collectOverviewColumnPaneIds(node: LayoutNode): string[] {
 	return [...collectOverviewColumnPaneIds(node.first), ...collectOverviewColumnPaneIds(node.second)];
 }
 
+function collectPaneIds(node: LayoutNode, result: string[] = []) {
+	if (node.type === "pane") {
+		result.push(node.pane.id);
+		return result;
+	}
+	collectPaneIds(node.first, result);
+	collectPaneIds(node.second, result);
+	return result;
+}
+
 function collectOverviewColumnRects(node: LayoutNode, x: number, width: number, result: OverviewColumnRect[]) {
 	if (node.type === "split" && node.direction === "vertical") {
 		const firstWidth = width * node.ratio;
@@ -404,9 +433,16 @@ function usePaneDrag({ paneRects, toWorld, onMovePane, onInsertColumn, resolveCo
 	const [dragState, setDragState] = useState<PaneDragState | null>(null);
 	const [hoverDrop, setHoverDrop] = useState<PaneDropTarget | null>(null);
 	const [columnInsertIndex, setColumnInsertIndex] = useState<number | null>(null);
+	const dragStateRef = useRef<PaneDragState | null>(null);
+	const hoverDropRef = useRef<PaneDropTarget | null>(null);
+	const columnInsertIndexRef = useRef<number | null>(null);
 
 	const startDrag = useCallback((paneId: string, clientX: number, clientY: number) => {
-		setDragState({ sourcePaneId: paneId, startClientX: clientX, startClientY: clientY, clientX, clientY, moved: false });
+		const nextDragState = { sourcePaneId: paneId, startClientX: clientX, startClientY: clientY, clientX, clientY, moved: false };
+		dragStateRef.current = nextDragState;
+		hoverDropRef.current = null;
+		columnInsertIndexRef.current = null;
+		setDragState(nextDragState);
 		setHoverDrop(null);
 		setColumnInsertIndex(null);
 	}, []);
@@ -415,33 +451,48 @@ function usePaneDrag({ paneRects, toWorld, onMovePane, onInsertColumn, resolveCo
 		if (!dragState) return;
 
 		const handleMove = (event: MouseEvent) => {
-			const deltaX = event.clientX - dragState.startClientX;
-			const deltaY = event.clientY - dragState.startClientY;
-			const moved = dragState.moved || Math.hypot(deltaX, deltaY) > moveThreshold;
-			setDragState((current) => (current ? { ...current, clientX: event.clientX, clientY: event.clientY, moved } : current));
+			const currentDragState = dragStateRef.current;
+			if (!currentDragState) return;
+			const deltaX = event.clientX - currentDragState.startClientX;
+			const deltaY = event.clientY - currentDragState.startClientY;
+			const moved = currentDragState.moved || Math.hypot(deltaX, deltaY) > moveThreshold;
+			const nextDragState = { ...currentDragState, clientX: event.clientX, clientY: event.clientY, moved };
+			dragStateRef.current = nextDragState;
+			setDragState(nextDragState);
 
 			const nextColumnInsertIndex = moved && onInsertColumn && paneRects.length > 1
-				? resolveColumnInsert?.(event.clientX, event.clientY, columnInsertIndex) ?? null
+				? resolveColumnInsert?.(event.clientX, event.clientY, columnInsertIndexRef.current) ?? null
 				: null;
+			columnInsertIndexRef.current = nextColumnInsertIndex;
 			setColumnInsertIndex(nextColumnInsertIndex);
 
 			const worldPoint = toWorld(event.clientX, event.clientY);
 			if (!worldPoint || nextColumnInsertIndex !== null) {
+				hoverDropRef.current = null;
 				setHoverDrop(null);
 				return;
 			}
 
-			setHoverDrop(hitTestPaneRects(paneRects, dragState.sourcePaneId, worldPoint.x, worldPoint.y));
+			const nextHoverDrop = hitTestPaneRects(paneRects, currentDragState.sourcePaneId, worldPoint.x, worldPoint.y);
+			hoverDropRef.current = nextHoverDrop;
+			setHoverDrop(nextHoverDrop);
 		};
 
 		const handleUp = () => {
-			if (dragState.moved && columnInsertIndex !== null && onInsertColumn) {
-				onInsertColumn(dragState.sourcePaneId, columnInsertIndex);
-			} else if (dragState.moved && hoverDrop) {
-				onMovePane(dragState.sourcePaneId, hoverDrop.targetPaneId, hoverDrop.position);
-			} else if (!dragState.moved && onClickPane) {
-				onClickPane(dragState.sourcePaneId);
+			const currentDragState = dragStateRef.current;
+			const currentColumnInsertIndex = columnInsertIndexRef.current;
+			const currentHoverDrop = hoverDropRef.current;
+			if (!currentDragState) return;
+			if (currentDragState.moved && currentColumnInsertIndex !== null && onInsertColumn) {
+				onInsertColumn(currentDragState.sourcePaneId, currentColumnInsertIndex);
+			} else if (currentDragState.moved && currentHoverDrop) {
+				onMovePane(currentDragState.sourcePaneId, currentHoverDrop.targetPaneId, currentHoverDrop.position);
+			} else if (!currentDragState.moved && onClickPane) {
+				onClickPane(currentDragState.sourcePaneId);
 			}
+			dragStateRef.current = null;
+			hoverDropRef.current = null;
+			columnInsertIndexRef.current = null;
 			setDragState(null);
 			setHoverDrop(null);
 			setColumnInsertIndex(null);
@@ -453,7 +504,7 @@ function usePaneDrag({ paneRects, toWorld, onMovePane, onInsertColumn, resolveCo
 			window.removeEventListener("mousemove", handleMove);
 			window.removeEventListener("mouseup", handleUp);
 		};
-	}, [columnInsertIndex, dragState, hoverDrop, moveThreshold, onClickPane, onInsertColumn, onMovePane, paneRects, resolveColumnInsert, toWorld]);
+	}, [dragState, moveThreshold, onClickPane, onInsertColumn, onMovePane, paneRects, resolveColumnInsert, toWorld]);
 
 	return { dragState, hoverDrop, columnInsertIndex, startDrag };
 }
@@ -475,6 +526,8 @@ function buildOverviewPreview(snapshot: string) {
 interface OverviewCanvasProps {
 	layout: LayoutNode;
 	focusedPaneId?: string;
+	initialDrag?: { paneId: string; clientX: number; clientY: number } | null;
+	onConsumeInitialDrag: () => void;
 	onFocusPane: (paneId: string) => void;
 	onMovePane: (sourcePaneId: string, targetPaneId: string, position: PaneDropPosition) => void;
 	onInsertColumn: (sourcePaneId: string, columnIndex: number) => void;
@@ -482,12 +535,15 @@ interface OverviewCanvasProps {
 	onExitOverview: () => void;
 }
 
-function OverviewCanvas({ layout, focusedPaneId, onFocusPane, onMovePane, onInsertColumn, onClosePane, onExitOverview }: OverviewCanvasProps) {
+function OverviewCanvas({ layout, focusedPaneId, initialDrag, onConsumeInitialDrag, onFocusPane, onMovePane, onInsertColumn, onClosePane, onExitOverview }: OverviewCanvasProps) {
 	const sessionManager = useSessionManager();
 	const stageRef = useRef<HTMLDivElement | null>(null);
 	const [viewport, setViewport] = useState({ width: 1, height: 1 });
 	const [camera, setCamera] = useState({ x: 0, y: 0, scale: 1 });
 	const [panState, setPanState] = useState<null | { startClientX: number; startClientY: number; originX: number; originY: number }>(null);
+	const overviewPanVelocityRef = useRef({ x: 0, y: 0 });
+	const overviewPanLastMoveRef = useRef<{ x: number; y: number; time: number } | null>(null);
+	const overviewPanMomentumRef = useRef<number | null>(null);
 
 	const contentWidth = (Math.max(getLayoutWidthUnits(layout), WIDTH_UNIT_BASE) / WIDTH_UNIT_BASE) * 1100;
 	const contentHeight = 760;
@@ -609,6 +665,15 @@ function OverviewCanvas({ layout, focusedPaneId, onFocusPane, onMovePane, onInse
 	});
 
 	useEffect(() => {
+		if (!initialDrag) return;
+		const rafId = window.requestAnimationFrame(() => {
+			startDrag(initialDrag.paneId, initialDrag.clientX, initialDrag.clientY);
+			onConsumeInitialDrag();
+		});
+		return () => window.cancelAnimationFrame(rafId);
+	}, [initialDrag, onConsumeInitialDrag, startDrag]);
+
+	useEffect(() => {
 		if (!panState) return;
 
 		const handleMove = (event: MouseEvent) => {
@@ -617,9 +682,60 @@ function OverviewCanvas({ layout, focusedPaneId, onFocusPane, onMovePane, onInse
 				x: panState.originX + (event.clientX - panState.startClientX),
 				y: panState.originY + (event.clientY - panState.startClientY),
 			}));
+
+			const now = performance.now();
+			const last = overviewPanLastMoveRef.current;
+			if (last) {
+				const deltaTime = Math.max(now - last.time, 1);
+				const instantVelocityX = (event.clientX - last.x) / deltaTime;
+				const instantVelocityY = (event.clientY - last.y) / deltaTime;
+				overviewPanVelocityRef.current = {
+					x: overviewPanVelocityRef.current.x * 0.62 + instantVelocityX * 0.38,
+					y: overviewPanVelocityRef.current.y * 0.62 + instantVelocityY * 0.38,
+				};
+			}
+			overviewPanLastMoveRef.current = { x: event.clientX, y: event.clientY, time: now };
 		};
 
-		const handleUp = () => setPanState(null);
+		const handleUp = () => {
+			setPanState(null);
+			overviewPanLastMoveRef.current = null;
+			const initialVelocity = overviewPanVelocityRef.current;
+			if (Math.hypot(initialVelocity.x, initialVelocity.y) < 0.03) {
+				overviewPanVelocityRef.current = { x: 0, y: 0 };
+				return;
+			}
+			if (overviewPanMomentumRef.current !== null) {
+				window.cancelAnimationFrame(overviewPanMomentumRef.current);
+				overviewPanMomentumRef.current = null;
+			}
+
+			const step = () => {
+				setCamera((current) => {
+					const velocity = overviewPanVelocityRef.current;
+					const nextCamera = {
+						...current,
+						x: current.x + velocity.x * 16,
+						y: current.y + velocity.y * 16,
+					};
+					overviewPanVelocityRef.current = {
+						x: velocity.x * 0.9,
+						y: velocity.y * 0.9,
+					};
+					return nextCamera;
+				});
+
+				if (Math.hypot(overviewPanVelocityRef.current.x, overviewPanVelocityRef.current.y) < 0.01) {
+					overviewPanVelocityRef.current = { x: 0, y: 0 };
+					overviewPanMomentumRef.current = null;
+					return;
+				}
+
+				overviewPanMomentumRef.current = window.requestAnimationFrame(step);
+			};
+
+			overviewPanMomentumRef.current = window.requestAnimationFrame(step);
+		};
 
 		window.addEventListener("mousemove", handleMove);
 		window.addEventListener("mouseup", handleUp);
@@ -628,6 +744,15 @@ function OverviewCanvas({ layout, focusedPaneId, onFocusPane, onMovePane, onInse
 			window.removeEventListener("mouseup", handleUp);
 		};
 	}, [panState]);
+
+	useEffect(() => {
+		return () => {
+			if (overviewPanMomentumRef.current !== null) {
+				window.cancelAnimationFrame(overviewPanMomentumRef.current);
+				overviewPanMomentumRef.current = null;
+			}
+		};
+	}, []);
 
 	const showOverviewColumnTargets = Boolean(dragState?.moved && columnRects.length > 0);
 	const renderedPaneRects = columnInsertIndex === null
@@ -639,38 +764,28 @@ function OverviewCanvas({ layout, focusedPaneId, onFocusPane, onMovePane, onInse
 	const draggedPane = dragState ? paneRects.find((rect) => rect.pane.id === dragState.sourcePaneId)?.pane ?? null : null;
 	const draggedActiveTab = draggedPane ? draggedPane.tabs.find((tab) => tab.id === draggedPane.activeTabId) ?? draggedPane.tabs[0] : null;
 	const draggedPreview = draggedActiveTab ? buildOverviewPreview(sessionManager.getSnapshot(draggedActiveTab.id) ?? "") : "No output yet";
-	const edgeGuideTop = camera.y;
-	const edgeGuideHeight = contentHeight * camera.scale;
-	const worldLeft = camera.x;
-	const worldRight = camera.x + contentWidth * camera.scale;
-	const columnInsertPreview = showOverviewColumnTargets && columnInsertIndex !== null && draggedPane
-		? {
-			label:
-				columnInsertIndex === 0
-					? "New left column"
-					: columnInsertIndex === columnRects.length
-						? "New right column"
-						: "Insert column",
-			title: draggedActiveTab?.title ?? "terminal",
-			tabCount: draggedPane.tabs.length,
-			preview: draggedPreview,
-			lineLeft:
-				columnInsertIndex === 0
-					? worldLeft
-					: columnInsertIndex === columnRects.length
-						? worldRight
-						: camera.x + columnRects[columnInsertIndex].x * camera.scale,
-			ghostLeft:
-				columnInsertIndex === 0
-					? worldLeft
-					: columnInsertIndex === columnRects.length
-						? worldRight
-						: camera.x + columnRects[columnInsertIndex].x * camera.scale,
-			ghostWidth: OVERVIEW_COLUMN_INSERT_WIDTH_WORLD * camera.scale,
-			top: camera.y,
-			height: contentHeight * camera.scale,
-		}
-		: null;
+	const columnInsertPreview =
+		showOverviewColumnTargets &&
+		columnInsertIndex !== null &&
+		draggedPane &&
+		columnInsertIndex > 0 &&
+		columnInsertIndex < columnRects.length
+			? (() => {
+				const ghostWidth = OVERVIEW_COLUMN_INSERT_WIDTH_WORLD * camera.scale;
+				const ghostLeft = camera.x + columnRects[columnInsertIndex].x * camera.scale;
+				return {
+					label: "Insert column",
+					title: draggedActiveTab?.title ?? "terminal",
+					tabCount: draggedPane.tabs.length,
+					preview: draggedPreview,
+					lineLeft: ghostLeft,
+					ghostLeft,
+					ghostWidth,
+					top: camera.y,
+					height: contentHeight * camera.scale,
+				};
+			})()
+			: null;
 	const overviewCloseScale = clamp(1 / camera.scale, 1, 2.4);
 
 	return (
@@ -681,6 +796,12 @@ function OverviewCanvas({ layout, focusedPaneId, onFocusPane, onMovePane, onInse
 				if (event.button !== 0) return;
 				const target = event.target as HTMLElement;
 				if (target.closest(".overview-pane-card")) return;
+				if (overviewPanMomentumRef.current !== null) {
+					window.cancelAnimationFrame(overviewPanMomentumRef.current);
+					overviewPanMomentumRef.current = null;
+				}
+				overviewPanVelocityRef.current = { x: 0, y: 0 };
+				overviewPanLastMoveRef.current = { x: event.clientX, y: event.clientY, time: performance.now() };
 				setPanState({
 					startClientX: event.clientX,
 					startClientY: event.clientY,
@@ -709,30 +830,6 @@ function OverviewCanvas({ layout, focusedPaneId, onFocusPane, onMovePane, onInse
 			}}
 		>
 			<div className="overview-hint">Drag panes. Drop on pane edges to split, center to swap, drag between columns to insert, or drag past the layout edge to make a new outer column. Scroll to zoom.</div>
-			{showOverviewColumnTargets ? (
-				<>
-					<div
-						className={`overview-edge-drop-zone left ${columnInsertIndex === 0 ? "active" : ""}`}
-						style={{
-							left: `${worldLeft - OVERVIEW_COLUMN_INSERT_THRESHOLD_PX}px`,
-							top: `${edgeGuideTop}px`,
-							height: `${edgeGuideHeight}px`,
-						}}
-					>
-						<div className="overview-edge-drop-zone-label">New left column</div>
-					</div>
-					<div
-						className={`overview-edge-drop-zone right ${columnInsertIndex === columnRects.length ? "active" : ""}`}
-						style={{
-							left: `${worldRight}px`,
-							top: `${edgeGuideTop}px`,
-							height: `${edgeGuideHeight}px`,
-						}}
-					>
-						<div className="overview-edge-drop-zone-label">New right column</div>
-					</div>
-				</>
-			) : null}
 			<div
 				className="overview-world"
 				style={{
@@ -828,6 +925,7 @@ interface WorkspaceViewProps {
 	onExitOverview: () => void;
 	onOpenOverview: () => void;
 	onAddPane: () => void;
+	onAddBrowserPane: () => void;
 	onOpenFile: (filePath: string) => void;
 	onUpdateTab: (paneId: string, tabId: string, updater: (tab: PaneTabModel) => PaneTabModel) => void;
 	onFocusPane: (paneId: string) => void;
@@ -846,6 +944,7 @@ export function WorkspaceView({
 	onExitOverview,
 	onOpenOverview,
 	onAddPane,
+	onAddBrowserPane,
 	onOpenFile,
 	onUpdateTab,
 	onFocusPane,
@@ -857,7 +956,10 @@ export function WorkspaceView({
 	const layoutRootRef = useRef<HTMLDivElement | null>(null);
 	const paneElementsRef = useRef(new Map<string, HTMLDivElement>());
 	const [zoomedPaneId, setZoomedPaneId] = useState<string | null>(null);
+	const [overviewSeedDrag, setOverviewSeedDrag] = useState<{ paneId: string; clientX: number; clientY: number } | null>(null);
 	const [middlePanning, setMiddlePanning] = useState(false);
+	const [newPaneMenuOpen, setNewPaneMenuOpen] = useState(false);
+	const newPaneMenuRef = useRef<HTMLDivElement | null>(null);
 
 	const middlePanStateRef = useRef<null | {
 		startClientX: number;
@@ -865,6 +967,9 @@ export function WorkspaceView({
 		originScrollLeft: number;
 		originScrollTop: number;
 	}>(null);
+	const middlePanVelocityRef = useRef({ x: 0, y: 0 });
+	const middlePanLastMoveRef = useRef<{ x: number; y: number; time: number } | null>(null);
+	const middlePanMomentumRafRef = useRef<number | null>(null);
 	const layoutRef = useRef(workspace.layout);
 
 	const registerPaneElement = useCallback((paneId: string, element: HTMLDivElement | null) => {
@@ -881,7 +986,7 @@ export function WorkspaceView({
 
 	const applyLayout = useCallback(
 		(transform: (layout: LayoutNode) => LayoutNode) => {
-			const nextLayout = transform(layoutRef.current);
+			const nextLayout = enforcePaneWidthCap(transform(layoutRef.current));
 			layoutRef.current = nextLayout;
 			onUpdateLayout(nextLayout);
 			return nextLayout;
@@ -891,7 +996,27 @@ export function WorkspaceView({
 
 	useEffect(() => {
 		setZoomedPaneId(null);
+		setNewPaneMenuOpen(false);
 	}, [workspace.id]);
+
+	useEffect(() => {
+		if (!newPaneMenuOpen) return;
+		const handlePointerDown = (event: MouseEvent) => {
+			const menu = newPaneMenuRef.current;
+			if (!menu) return;
+			if (menu.contains(event.target as Node)) return;
+			setNewPaneMenuOpen(false);
+		};
+		const handleKeyDown = (event: KeyboardEvent) => {
+			if (event.key === "Escape") setNewPaneMenuOpen(false);
+		};
+		window.addEventListener("mousedown", handlePointerDown);
+		window.addEventListener("keydown", handleKeyDown);
+		return () => {
+			window.removeEventListener("mousedown", handlePointerDown);
+			window.removeEventListener("keydown", handleKeyDown);
+		};
+	}, [newPaneMenuOpen]);
 
 	useEffect(() => {
 		if (!zoomedPaneId) return;
@@ -939,15 +1064,69 @@ export function WorkspaceView({
 			const state = middlePanStateRef.current;
 			const container = layoutRootRef.current;
 			if (!state || !container) return;
+
 			const deltaX = event.clientX - state.startClientX;
 			const deltaY = event.clientY - state.startClientY;
 			container.scrollLeft = state.originScrollLeft - deltaX;
 			container.scrollTop = state.originScrollTop - deltaY;
+
+			const now = performance.now();
+			const last = middlePanLastMoveRef.current;
+			if (last) {
+				const deltaTime = Math.max(now - last.time, 1);
+				const instantVelocityX = (event.clientX - last.x) / deltaTime;
+				const instantVelocityY = (event.clientY - last.y) / deltaTime;
+				middlePanVelocityRef.current = {
+					x: middlePanVelocityRef.current.x * 0.62 + instantVelocityX * 0.38,
+					y: middlePanVelocityRef.current.y * 0.62 + instantVelocityY * 0.38,
+				};
+			}
+			middlePanLastMoveRef.current = { x: event.clientX, y: event.clientY, time: now };
 		};
 
 		const stopMiddlePan = () => {
 			middlePanStateRef.current = null;
+			middlePanLastMoveRef.current = null;
 			setMiddlePanning(false);
+
+			const launchVelocity = middlePanVelocityRef.current;
+			const speed = Math.hypot(launchVelocity.x, launchVelocity.y);
+			if (speed < 0.03) {
+				middlePanVelocityRef.current = { x: 0, y: 0 };
+				return;
+			}
+
+			if (middlePanMomentumRafRef.current !== null) {
+				window.cancelAnimationFrame(middlePanMomentumRafRef.current);
+				middlePanMomentumRafRef.current = null;
+			}
+
+			const step = () => {
+				const container = layoutRootRef.current;
+				if (!container) {
+					middlePanMomentumRafRef.current = null;
+					return;
+				}
+
+				const velocity = middlePanVelocityRef.current;
+				container.scrollLeft -= velocity.x * 16;
+				container.scrollTop -= velocity.y * 16;
+
+				middlePanVelocityRef.current = {
+					x: velocity.x * 0.9,
+					y: velocity.y * 0.9,
+				};
+
+				if (Math.hypot(middlePanVelocityRef.current.x, middlePanVelocityRef.current.y) < 0.01) {
+					middlePanVelocityRef.current = { x: 0, y: 0 };
+					middlePanMomentumRafRef.current = null;
+					return;
+				}
+
+				middlePanMomentumRafRef.current = window.requestAnimationFrame(step);
+			};
+
+			middlePanMomentumRafRef.current = window.requestAnimationFrame(step);
 		};
 
 		window.addEventListener("mousemove", handleMouseMove);
@@ -958,11 +1137,20 @@ export function WorkspaceView({
 		};
 	}, [middlePanning]);
 
+	useEffect(() => {
+		return () => {
+			if (middlePanMomentumRafRef.current !== null) {
+				window.cancelAnimationFrame(middlePanMomentumRafRef.current);
+				middlePanMomentumRafRef.current = null;
+			}
+		};
+	}, []);
+
 	const handleClosePane = useCallback(
 		(paneId: string) => {
 			const pane = findPaneById(layoutRef.current, paneId);
 			if (pane) {
-				const dirtyEditors = pane.tabs.filter((tab) => tab.kind === "editor" && tab.dirty);
+				const dirtyEditors = pane.tabs.filter((tab) => (tab.kind === "editor" || tab.kind === "markdown") && tab.dirty);
 				if (dirtyEditors.length > 0) {
 					const shouldClose = window.confirm(`Discard unsaved changes in ${dirtyEditors.length} tab${dirtyEditors.length === 1 ? "" : "s"}?`);
 					if (!shouldClose) return;
@@ -1039,12 +1227,44 @@ export function WorkspaceView({
 		[applyLayout, onFocusPane, workspace.path],
 	);
 
+	const handleDropTabToPane = useCallback(
+		(sourcePaneId: string, tabId: string, targetPaneId: string, position: PaneDropPosition) => {
+			if (position === "center") {
+				handleMoveTab(sourcePaneId, tabId, targetPaneId);
+				return;
+			}
+
+			const splitDirection: SplitDirection = position === "left" || position === "right" ? "vertical" : "horizontal";
+			let destinationPaneId: string | null = null;
+
+			applyLayout((layout) => {
+				const paneIdsBefore = new Set(collectPaneIds(layout));
+				let splitLayout = splitNode(layout, targetPaneId, splitDirection, workspace.path);
+				const paneIdsAfter = collectPaneIds(splitLayout);
+				const insertedPaneId = paneIdsAfter.find((paneId) => !paneIdsBefore.has(paneId)) ?? null;
+				if (!insertedPaneId) return layout;
+
+				if (position === "left" || position === "top") {
+					splitLayout = swapPanes(splitLayout, targetPaneId, insertedPaneId);
+				}
+
+				destinationPaneId = insertedPaneId;
+				return moveTabToPane(splitLayout, sourcePaneId, tabId, insertedPaneId, workspace.path);
+			});
+
+			if (destinationPaneId && findPaneById(layoutRef.current, destinationPaneId)) {
+				onFocusPane(destinationPaneId);
+			}
+		},
+		[applyLayout, handleMoveTab, onFocusPane, workspace.path],
+	);
+
 	const handleCloseTab = useCallback(
 		(paneId: string, tabId: string) => {
 			const pane = findPaneById(layoutRef.current, paneId);
 			const tab = pane?.tabs.find((item) => item.id === tabId);
 			if (!tab) return;
-			if (tab.kind === "editor" && tab.dirty) {
+			if ((tab.kind === "editor" || tab.kind === "markdown") && tab.dirty) {
 				const shouldClose = window.confirm(`Discard unsaved changes in ${tab.title}?`);
 				if (!shouldClose) return;
 			}
@@ -1054,6 +1274,15 @@ export function WorkspaceView({
 			applyLayout((layout) => closeTab(layout, paneId, tabId, workspace.path));
 		},
 		[applyLayout, sessionManager, workspace.path],
+	);
+
+	const handleBeginPaneShiftDrag = useCallback(
+		(paneId: string, clientX: number, clientY: number) => {
+			onFocusPane(paneId);
+			setOverviewSeedDrag({ paneId, clientX, clientY });
+			onOpenOverview();
+		},
+		[onFocusPane, onOpenOverview],
 	);
 
 	const handleTogglePaneZoom = useCallback(
@@ -1089,11 +1318,14 @@ export function WorkspaceView({
 	);
 
 	const zoomedPane = !overviewOpen && zoomedPaneId ? findPaneById(workspace.layout, zoomedPaneId) : null;
+	const minimapWorldWidth = (Math.max(getLayoutWidthUnits(workspace.layout), WIDTH_UNIT_BASE) / WIDTH_UNIT_BASE) * 100;
+	const minimapWorldHeight = 100;
+	const minimapAspectRatio = minimapWorldWidth / minimapWorldHeight;
 	const minimapPaneRects = useMemo(() => {
 		const rects: OverviewPaneRect[] = [];
-		collectOverviewPaneRects(workspace.layout, 0, 0, 100, 100, rects);
+		collectOverviewPaneRects(workspace.layout, 0, 0, minimapWorldWidth, minimapWorldHeight, rects);
 		return rects;
-	}, [workspace.layout]);
+	}, [minimapWorldHeight, minimapWorldWidth, workspace.layout]);
 
 	const focusPaneFromMap = useCallback(
 		(paneId: string) => {
@@ -1124,6 +1356,12 @@ export function WorkspaceView({
 					event.stopPropagation();
 					const container = layoutRootRef.current;
 					if (!container) return;
+					if (middlePanMomentumRafRef.current !== null) {
+						window.cancelAnimationFrame(middlePanMomentumRafRef.current);
+						middlePanMomentumRafRef.current = null;
+					}
+					middlePanVelocityRef.current = { x: 0, y: 0 };
+					middlePanLastMoveRef.current = { x: event.clientX, y: event.clientY, time: performance.now() };
 					middlePanStateRef.current = {
 						startClientX: event.clientX,
 						startClientY: event.clientY,
@@ -1142,6 +1380,8 @@ export function WorkspaceView({
 					<OverviewCanvas
 						layout={workspace.layout}
 						focusedPaneId={focusedPaneId}
+						initialDrag={overviewSeedDrag}
+						onConsumeInitialDrag={() => setOverviewSeedDrag(null)}
 						onFocusPane={onFocusPane}
 						onMovePane={handleOverviewMovePane}
 						onInsertColumn={handleMovePaneToColumn}
@@ -1172,10 +1412,13 @@ export function WorkspaceView({
 									onSplitHorizontal={() => onSplitPane(zoomedPane.id, "horizontal")}
 									onClose={() => handleClosePane(zoomedPane.id)}
 									onAddTab={() => applyLayout((layout) => addTabToPane(layout, zoomedPane.id, workspace.path))}
+									onAddBrowserTab={() => applyLayout((layout) => addBrowserTabToPane(layout, zoomedPane.id))}
 									onSelectTab={(tabId) => applyLayout((layout) => setActiveTab(layout, zoomedPane.id, tabId))}
 									onCloseTab={(tabId) => handleCloseTab(zoomedPane.id, tabId)}
 									onMoveTab={handleMoveTab}
+									onDropTabToPane={(sourcePaneId, tabId, position) => handleDropTabToPane(sourcePaneId, tabId, zoomedPane.id, position)}
 									onToggleZoom={() => handleTogglePaneZoom(zoomedPane.id)}
+									onBeginShiftDrag={(clientX, clientY) => handleBeginPaneShiftDrag(zoomedPane.id, clientX, clientY)}
 									onUpdateTabMeta={(tabId, patch) => applyLayout((layout) => updateTabMeta(layout, zoomedPane.id, tabId, patch))}
 									onOpenFile={onOpenFile}
 									onUpdateTab={(tabId, updater) => onUpdateTab(zoomedPane.id, tabId, updater)}
@@ -1195,10 +1438,13 @@ export function WorkspaceView({
 								canMovePaneToNewColumn={canMovePaneToNewColumn}
 								onClosePane={handleClosePane}
 								onAddTab={(paneId) => applyLayout((layout) => addTabToPane(layout, paneId, workspace.path))}
+								onAddBrowserTab={(paneId) => applyLayout((layout) => addBrowserTabToPane(layout, paneId))}
 								onSelectTab={(paneId, tabId) => applyLayout((layout) => setActiveTab(layout, paneId, tabId))}
 								onCloseTab={handleCloseTab}
 								onMoveTab={handleMoveTab}
+								onDropTabToPane={handleDropTabToPane}
 								onTogglePaneZoom={handleTogglePaneZoom}
+								onBeginPaneShiftDrag={handleBeginPaneShiftDrag}
 								onResizeHorizontalSplit={(splitId, ratio) => applyLayout((layout) => updateSplitRatio(layout, splitId, ratio))}
 								onResizeVerticalSplitBranch={(splitId, branch, deltaRatio) =>
 									applyLayout((layout) => resizeVerticalSplitByDelta(layout, splitId, deltaRatio, branch))
@@ -1222,12 +1468,49 @@ export function WorkspaceView({
 					>
 						⊞
 					</button>
-					<button type="button" className="new-pane-button workspace-corner-new-pane" onClick={onAddPane} aria-label="Add a new pane">
-						<span className="new-pane-plus">+</span> New Pane
-					</button>
+					<div className="new-pane-menu-wrap" ref={newPaneMenuRef}>
+						{newPaneMenuOpen ? (
+							<div className="new-pane-menu" role="menu" aria-label="Choose pane type">
+								<button
+									type="button"
+									className="new-pane-menu-item"
+									onClick={() => {
+										setNewPaneMenuOpen(false);
+										onAddPane();
+									}}
+								>
+									New Terminal Pane
+								</button>
+								<button
+									type="button"
+									className="new-pane-menu-item"
+									onClick={() => {
+										setNewPaneMenuOpen(false);
+										onAddBrowserPane();
+									}}
+								>
+									New Browser Pane
+								</button>
+							</div>
+						) : null}
+						<button
+							type="button"
+							className="new-pane-button workspace-corner-new-pane"
+							onClick={() => setNewPaneMenuOpen((current) => !current)}
+							aria-label="Add a new pane"
+						>
+							<span className="new-pane-plus">+</span> New Pane
+						</button>
+					</div>
 				</div>
 				{showMinimap ? (
-					<div className="pane-minimap" role="navigation" aria-label="Pane minimap" onDoubleClick={onOpenOverview}>
+					<div
+						className="pane-minimap"
+						style={{ ["--minimap-aspect" as string]: String(minimapAspectRatio) }}
+						role="navigation"
+						aria-label="Pane minimap"
+						onDoubleClick={onOpenOverview}
+					>
 						<div className="pane-minimap-track">
 							{minimapPaneRects.map((rect) => {
 								const activeTab = rect.pane.tabs.find((tab) => tab.id === rect.pane.activeTabId) ?? rect.pane.tabs[0];
@@ -1236,11 +1519,11 @@ export function WorkspaceView({
 										key={rect.pane.id}
 										className={`pane-minimap-pane ${focusedPaneId === rect.pane.id ? "active" : ""}`}
 										style={{
-											left: `${rect.x}%`,
-											top: `${rect.y}%`,
-											width: `${rect.width}%`,
-											height: `${rect.height}%`,
-										}}
+										left: `${(rect.x / minimapWorldWidth) * 100}%`,
+										top: `${(rect.y / minimapWorldHeight) * 100}%`,
+										width: `${(rect.width / minimapWorldWidth) * 100}%`,
+										height: `${(rect.height / minimapWorldHeight) * 100}%`,
+									}}
 										onClick={() => focusPaneFromMap(rect.pane.id)}
 										onKeyDown={(event) => {
 											if (event.key === "Enter" || event.key === " ") {

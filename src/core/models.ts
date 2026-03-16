@@ -24,7 +24,7 @@ export interface WorkspaceModel {
 interface PaneTabBase {
 	id: string;
 	title: string;
-	kind: "terminal" | "fileTree" | "editor" | "markdown";
+	kind: "terminal" | "fileTree" | "editor" | "markdown" | "image" | "pdf" | "browser";
 }
 
 export interface TerminalTabModel extends PaneTabBase {
@@ -53,9 +53,27 @@ export interface MarkdownTabModel extends PaneTabBase {
 	kind: "markdown";
 	filePath: string;
 	content: string;
+	savedContent: string;
+	dirty: boolean;
+	message?: string;
 }
 
-export type PaneTabModel = TerminalTabModel | FileTreeTabModel | EditorTabModel | MarkdownTabModel;
+export interface ImageTabModel extends PaneTabBase {
+	kind: "image";
+	filePath: string;
+}
+
+export interface PdfTabModel extends PaneTabBase {
+	kind: "pdf";
+	filePath: string;
+}
+
+export interface BrowserTabModel extends PaneTabBase {
+	kind: "browser";
+	url: string;
+}
+
+export type PaneTabModel = TerminalTabModel | FileTreeTabModel | EditorTabModel | MarkdownTabModel | ImageTabModel | PdfTabModel | BrowserTabModel;
 
 export interface PaneModel {
 	id: string;

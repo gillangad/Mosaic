@@ -15,7 +15,9 @@ contextBridge.exposeInMainWorld("mosaic", {
 	inspectWorkspace: (directoryPath) => ipcRenderer.invoke("workspace:inspect", directoryPath),
 	readDirectory: (workspacePath, directoryPath) => ipcRenderer.invoke("fs:readDir", { workspacePath, directoryPath }),
 	readFile: (filePath) => ipcRenderer.invoke("fs:readFile", filePath),
+	readFileBase64: (filePath) => ipcRenderer.invoke("fs:readFileBase64", filePath),
 	writeFile: (filePath, contents) => ipcRenderer.invoke("fs:writeFile", { filePath, contents }),
+	getBrowserCdpTarget: (webContentsId, url, title) => ipcRenderer.invoke("browser:getCdpTarget", { webContentsId, url, title }),
 	updateTitleBarOverlay: (payload) => ipcRenderer.invoke("window:updateTitleBarOverlay", payload),
 	subscribeTerminal: (id, handlers) => {
 		const subscriptionId = createSubscriptionId();

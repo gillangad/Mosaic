@@ -143,16 +143,16 @@ export function FileTreeSidebar({ rootPath, onOpenFile }: FileTreeSidebarProps) 
 			}
 			if (entries.length === 0) return null;
 			return (
-				<ul className="file-tree-list" role={depth === 0 ? "tree" : "group"}>
+				<ul className="file-tree-list tw-m-0 tw-list-none tw-p-0" role={depth === 0 ? "tree" : "group"}>
 					{entries.map((entry) => {
 						const isExpanded = expandedPaths.has(entry.path) || (!!filterLower && entry.isDirectory);
 						const isLoading = loadingPaths.has(entry.path);
 						const childCount = entriesByPath[entry.path]?.length;
 						return (
-							<li key={entry.path} className="file-tree-item" style={{ ["--tree-depth" as string]: String(depth) }}>
+							<li key={entry.path} className="file-tree-item tw-relative" style={{ ["--tree-depth" as string]: String(depth) }}>
 								<button
 									type="button"
-									className={`file-tree-row ${entry.isDirectory ? "directory" : "file"} ${selectedPath === entry.path ? "selected" : ""}`}
+									className={`file-tree-row tw-flex tw-w-full tw-min-w-0 tw-items-center tw-gap-1 ${entry.isDirectory ? "directory" : "file"} ${selectedPath === entry.path ? "selected" : ""}`}
 									onClick={() => {
 										if (entry.isDirectory) {
 											toggleDirectory(entry);
@@ -194,16 +194,16 @@ export function FileTreeSidebar({ rootPath, onOpenFile }: FileTreeSidebarProps) 
 	const rendered = useMemo(() => renderEntries(rootPath, 0), [renderEntries, rootPath]);
 
 	return (
-		<div className="file-tree-surface workspace-file-tree-surface">
-			<div className="file-tree-toolbar">
-				<div className="file-tree-search">
+		<div className="file-tree-surface workspace-file-tree-surface tw-flex tw-h-full tw-min-h-0 tw-flex-col">
+			<div className="file-tree-toolbar tw-flex tw-items-center tw-gap-2">
+				<div className="file-tree-search tw-flex tw-min-w-0 tw-flex-1 tw-items-center">
 					<svg className="file-tree-search-icon" viewBox="0 0 16 16" fill="none">
 						<circle cx="7" cy="7" r="4.5" stroke="currentColor" strokeWidth="1.2" />
 						<path d="M10.5 10.5L14 14" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
 					</svg>
 					<input
 						type="text"
-						className="file-tree-search-input"
+						className="file-tree-search-input tw-w-full tw-bg-transparent tw-outline-none"
 						value={filterQuery}
 						onChange={(event) => setFilterQuery(event.target.value)}
 						placeholder="Filter files…"
@@ -230,7 +230,7 @@ export function FileTreeSidebar({ rootPath, onOpenFile }: FileTreeSidebarProps) 
 				</button>
 			</div>
 			{error ? <div className="file-tree-error">{error}</div> : null}
-			<div className="file-tree-scroll">{rendered}</div>
+			<div className="file-tree-scroll tw-min-h-0 tw-flex-1 tw-overflow-auto">{rendered}</div>
 		</div>
 	);
 }

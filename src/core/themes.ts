@@ -148,6 +148,51 @@ function enforceThemeConstraints(themeMap: Record<string, MosaicTheme>) {
 }
 
 const baseThemes: Record<string, MosaicTheme> = {
+	default: {
+		id: "default",
+		name: "Default",
+		kind: "dark",
+
+		bgVoid: "#1a1922",
+		bgSurface: "#211f2d",
+		bgWell: "#211f2d",
+
+		borderDim: "rgba(180, 170, 220, 0.06)",
+		borderGlow: "rgba(180, 170, 220, 0.14)",
+
+		textPrimary: "#e6e4ef",
+		textSecondary: "#807c92",
+		textMuted: "#4a475a",
+
+		statusSuccess: "#6ed4a0",
+		statusWarn: "#e0b86c",
+		statusError: "#e85a5a",
+
+		accents: {
+			product: "#9580ff",
+			engineering: "#60c8d0",
+			research: "#d080c0",
+			ops: "#e0b86c",
+		},
+
+		terminal: {
+			foreground: "#d4d0e4",
+			cursor: "#9580ff",
+			cursorAccent: "#211f2d",
+			selectionBackground: "rgba(149, 128, 255, 0.12)",
+			black: "#1a1922",
+			brightBlack: "#4a475a",
+			red: "#e85a5a",
+			green: "#6ed4a0",
+			yellow: "#e0b86c",
+			blue: "#7a9aef",
+			magenta: "#d080c0",
+			cyan: "#60c8d0",
+			white: "#d4d0e4",
+			brightWhite: "#f0eef8",
+		},
+	},
+
 	midnight: {
 		id: "midnight",
 		name: "Midnight",
@@ -377,7 +422,7 @@ const baseThemes: Record<string, MosaicTheme> = {
 
 export const themes = enforceThemeConstraints(baseThemes);
 export const themeIds = Object.keys(themes) as Array<keyof typeof themes>;
-export const defaultThemeId = "carbon";
+export const defaultThemeId = "default";
 
 function toHueSortKey(color: string) {
 	const normalized = color.trim();

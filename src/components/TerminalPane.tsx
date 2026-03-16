@@ -8,17 +8,18 @@ import {
 	type MouseEvent as ReactMouseEvent,
 } from "react";
 import MonacoEditor from "@monaco-editor/react";
-import ReactMarkdown from "react-markdown";
-import rehypeHighlight from "rehype-highlight";
-import remarkGfm from "remark-gfm";
+import "react-pdf/dist/Page/AnnotationLayer.css";
+import "react-pdf/dist/Page/TextLayer.css";
 import { Terminal } from "xterm";
 import { FitAddon } from "xterm-addon-fit";
 import { SearchAddon } from "xterm-addon-search";
 import { SerializeAddon } from "xterm-addon-serialize";
 import { WebLinksAddon } from "xterm-addon-web-links";
 import { useSessionManager, useTerminalBackend } from "../core/terminal-backend-context";
-import type { EditorTabModel, FileTreeTabModel, PaneModel, PaneTabModel, TerminalTabModel } from "../core/models";
-import { getTabStatus, isEditorTab } from "../core/pane-tabs";
+import type { BrowserTabModel, EditorTabModel, FileTreeTabModel, ImageTabModel, PaneModel, PaneTabModel, PdfTabModel, TerminalTabModel } from "../core/models";
+import { BrowserPane } from "./BrowserPane";
+import type { PaneDropPosition } from "../core/layout";
+import { getTabStatus } from "../core/pane-tabs";
 import type { MosaicTheme } from "../core/themes";
 
 interface TerminalTabSurfaceProps {
@@ -44,10 +45,13 @@ interface TerminalPaneProps {
 	onSplitHorizontal: () => void;
 	onClose: () => void;
 	onAddTab: () => void;
+	onAddBrowserTab: () => void;
 	onSelectTab: (tabId: string) => void;
 	onCloseTab: (tabId: string) => void;
 	onMoveTab: (sourcePaneId: string, tabId: string, targetPaneId: string) => void;
+	onDropTabToPane: (sourcePaneId: string, tabId: string, position: PaneDropPosition) => void;
 	onToggleZoom: () => void;
+	onBeginShiftDrag: (clientX: number, clientY: number) => void;
 	onUpdateTabMeta: (tabId: string, patch: Partial<Pick<TerminalTabModel, "status" | "shellLabel" | "message" | "title">>) => void;
 	onOpenFile: (filePath: string) => void;
 	onUpdateTab: (tabId: string, updater: (tab: PaneTabModel) => PaneTabModel) => void;
@@ -82,6 +86,7 @@ function buildTerminalTheme(theme: MosaicTheme, accent: string) {
 }
 
 const PANE_TAB_DND_TYPE = "application/x-mosaic-pane-tab";
+const PDF_WORKER_SRC = new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url).toString();
 
 function parseDraggedTab(event: Pick<DragEvent, "dataTransfer">) {
 	const payload = event.dataTransfer?.getData(PANE_TAB_DND_TYPE);
@@ -95,48 +100,55 @@ function parseDraggedTab(event: Pick<DragEvent, "dataTransfer">) {
 	}
 }
 
-function isExternalUrl(value: string) {
-	return /^(https?:|mailto:|tel:|#)/i.test(value);
+function resolvePaneDropPosition(rect: DOMRect, clientX: number, clientY: number): PaneDropPosition {
+	const relativeX = (clientX - rect.left) / Math.max(rect.width, 1);
+	const relativeY = (clientY - rect.top) / Math.max(rect.height, 1);
+
+	if (relativeX > 0.28 && relativeX < 0.72 && relativeY > 0.28 && relativeY < 0.72) {
+		return "center";
+	}
+
+	const distances = [
+		{ position: "left" as const, value: relativeX },
+		{ position: "right" as const, value: 1 - relativeX },
+		{ position: "top" as const, value: relativeY },
+		{ position: "bottom" as const, value: 1 - relativeY },
+	].sort((a, b) => a.value - b.value);
+
+	return distances[0].position;
 }
 
 function normalizeSeparators(value: string) {
 	return value.replace(/\\/g, "/");
 }
 
-function dirname(filePath: string) {
+function getFileExtension(filePath: string) {
 	const normalized = normalizeSeparators(filePath);
-	const index = normalized.lastIndexOf("/");
-	return index <= 0 ? normalized : normalized.slice(0, index);
+	const leaf = normalized.split("/").at(-1) ?? normalized;
+	const dotIndex = leaf.lastIndexOf(".");
+	if (dotIndex <= 0 || dotIndex === leaf.length - 1) return "";
+	return leaf.slice(dotIndex + 1).toLowerCase();
 }
 
-function resolveLocalPath(baseFilePath: string, target: string) {
-	const [targetPath, hash = ""] = target.split("#", 2);
-	const baseDir = dirname(baseFilePath);
-	const initial = targetPath.startsWith("/")
-		? targetPath
-		: `${normalizeSeparators(baseDir)}/${targetPath}`;
-	const parts = initial.split("/");
-	const resolved: string[] = [];
-	for (const part of parts) {
-		if (!part || part === ".") continue;
-		if (part === "..") {
-			if (resolved.length > 0 && resolved.at(-1) !== "..") resolved.pop();
-			continue;
-		}
-		resolved.push(part);
-	}
-	const joined = resolved.join("/");
-	const hasDrive = /^[a-zA-Z]:/.test(joined);
-	const absolute = hasDrive ? joined : `/${joined}`;
-	return hash ? `${absolute}#${hash}` : absolute;
+function getMimeTypeForImage(filePath: string) {
+	const extension = getFileExtension(filePath);
+	if (extension === "jpg" || extension === "jpeg") return "image/jpeg";
+	if (extension === "png") return "image/png";
+	if (extension === "gif") return "image/gif";
+	if (extension === "svg") return "image/svg+xml";
+	if (extension === "webp") return "image/webp";
+	if (extension === "bmp") return "image/bmp";
+	if (extension === "ico") return "image/x-icon";
+	return "application/octet-stream";
 }
 
-function toFileUrl(filePath: string) {
-	const normalized = normalizeSeparators(filePath);
-	if (/^[a-zA-Z]:\//.test(normalized)) {
-		return `file:///${encodeURI(normalized)}`;
+function base64ToUint8Array(base64: string) {
+	const binary = window.atob(base64);
+	const bytes = new Uint8Array(binary.length);
+	for (let index = 0; index < binary.length; index += 1) {
+		bytes[index] = binary.charCodeAt(index);
 	}
-	return `file://${encodeURI(normalized.startsWith("/") ? normalized : `/${normalized}`)}`;
+	return bytes;
 }
 
 function FileTypeIcon({ entry }: { entry: FileTreeEntry }) {
@@ -192,6 +204,7 @@ function TerminalTabSurface({ tab, accent, theme, cwd, isActive, onUpdateTabMeta
 	const searchInputRef = useRef<HTMLInputElement | null>(null);
 	const [searchOpen, setSearchOpen] = useState(false);
 	const [searchQuery, setSearchQuery] = useState("");
+	const [searchMatchState, setSearchMatchState] = useState({ current: 0, total: 0 });
 
 	useEffect(() => {
 		updateTabMetaRef.current = onUpdateTabMeta;
@@ -396,6 +409,49 @@ function TerminalTabSurface({ tab, accent, theme, cwd, isActive, onUpdateTabMeta
 		}
 	}, []);
 
+	const countTerminalMatches = useCallback((query: string) => {
+		const terminal = terminalInstanceRef.current;
+		if (!terminal || !query) return 0;
+
+		const loweredQuery = query.toLowerCase();
+		const { active } = terminal.buffer;
+		const maxLine = active.baseY + active.length;
+		let total = 0;
+
+		for (let lineIndex = 0; lineIndex < maxLine; lineIndex += 1) {
+			const line = active.getLine(lineIndex);
+			if (!line) continue;
+			const text = line.translateToString(true).toLowerCase();
+			if (!text) continue;
+			let searchIndex = text.indexOf(loweredQuery);
+			while (searchIndex !== -1) {
+				total += 1;
+				searchIndex = text.indexOf(loweredQuery, searchIndex + Math.max(loweredQuery.length, 1));
+			}
+		}
+
+		return total;
+	}, []);
+
+	const runSearch = useCallback((query: string) => {
+		if (!query) {
+			searchAddonRef.current?.clearDecorations();
+			setSearchMatchState({ current: 0, total: 0 });
+			return;
+		}
+
+		const total = countTerminalMatches(query);
+		const found = searchAddonRef.current?.findNext(query, {
+			decorations: {
+				matchOverviewRuler: "#888",
+				activeMatchColorOverviewRuler: "#fff",
+				matchBackground: "#555",
+				activeMatchBackground: "#e8a634",
+			},
+		}) ?? false;
+		setSearchMatchState({ current: found && total > 0 ? 1 : 0, total });
+	}, [countTerminalMatches]);
+
 	const openSearch = useCallback(() => {
 		setSearchOpen(true);
 	}, []);
@@ -403,85 +459,93 @@ function TerminalTabSurface({ tab, accent, theme, cwd, isActive, onUpdateTabMeta
 	const closeSearch = useCallback(() => {
 		setSearchOpen(false);
 		setSearchQuery("");
+		setSearchMatchState({ current: 0, total: 0 });
 		searchAddonRef.current?.clearDecorations();
 		terminalInstanceRef.current?.focus();
 	}, []);
 
 	const handleSearchChange = useCallback((value: string) => {
 		setSearchQuery(value);
-		if (value) {
-			searchAddonRef.current?.findNext(value, {
-				decorations: {
-					matchOverviewRuler: "#888",
-					activeMatchColorOverviewRuler: "#fff",
-					matchBackground: "#555",
-					activeMatchBackground: "#e8a634",
-				},
-			});
-		} else {
-			searchAddonRef.current?.clearDecorations();
-		}
-	}, []);
+		runSearch(value);
+	}, [runSearch]);
 
 	const handleSearchNext = useCallback(() => {
-		if (searchQuery) searchAddonRef.current?.findNext(searchQuery);
-	}, [searchQuery]);
+		if (!searchQuery) return;
+		const found = searchAddonRef.current?.findNext(searchQuery) ?? false;
+		if (!found || searchMatchState.total === 0) return;
+		setSearchMatchState((current) => ({
+			...current,
+			current: current.current >= current.total ? 1 : current.current + 1,
+		}));
+	}, [searchMatchState.total, searchQuery]);
 
 	const handleSearchPrev = useCallback(() => {
-		if (searchQuery) searchAddonRef.current?.findPrevious(searchQuery);
-	}, [searchQuery]);
-
-	useEffect(() => {
-		if (!isActive) return;
-		const handleKeydown = (event: KeyboardEvent) => {
-			if ((event.ctrlKey || event.metaKey) && event.key === "f") {
-				event.preventDefault();
-				openSearch();
-			}
-			if (event.key === "Escape" && searchOpen) {
-				closeSearch();
-			}
-		};
-		window.addEventListener("keydown", handleKeydown);
-		return () => window.removeEventListener("keydown", handleKeydown);
-	}, [isActive, searchOpen, openSearch, closeSearch]);
+		if (!searchQuery) return;
+		const found = searchAddonRef.current?.findPrevious(searchQuery) ?? false;
+		if (!found || searchMatchState.total === 0) return;
+		setSearchMatchState((current) => ({
+			...current,
+			current: current.current <= 1 ? current.total : current.current - 1,
+		}));
+	}, [searchMatchState.total, searchQuery]);
 
 	useEffect(() => {
 		if (searchOpen && searchInputRef.current) {
 			searchInputRef.current.focus();
+			searchInputRef.current.select();
 		}
 	}, [searchOpen]);
 
 	return (
-		<div className={`pane-tab-surface ${isActive ? "active" : ""}`}>
-			{searchOpen ? (
-				<div className="terminal-search-bar">
-					<input
-						ref={searchInputRef}
-						type="text"
-						className="terminal-search-input"
-						value={searchQuery}
-						onChange={(event) => handleSearchChange(event.target.value)}
-						onKeyDown={(event) => {
-							if (event.key === "Enter") {
-								event.preventDefault();
-								if (event.shiftKey) handleSearchPrev();
-								else handleSearchNext();
-							}
-							if (event.key === "Escape") {
-								event.preventDefault();
-								closeSearch();
-							}
-						}}
-						placeholder="Find…"
-						spellCheck={false}
-					/>
-					<button type="button" className="terminal-search-nav" onClick={handleSearchPrev} aria-label="Previous match">▲</button>
-					<button type="button" className="terminal-search-nav" onClick={handleSearchNext} aria-label="Next match">▼</button>
-					<button type="button" className="terminal-search-close" onClick={closeSearch} aria-label="Close search">×</button>
-				</div>
-			) : null}
+		<div
+			className={`pane-tab-surface ${isActive ? "active" : ""}`}
+			onKeyDownCapture={(event) => {
+				if (!isActive) return;
+				if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === "f") {
+					event.preventDefault();
+					event.stopPropagation();
+					openSearch();
+					return;
+				}
+				if (event.key === "Escape" && searchOpen) {
+					event.preventDefault();
+					event.stopPropagation();
+					closeSearch();
+				}
+			}}
+		>
 			<div className="terminal-well scanline-well" onContextMenu={handleContextMenu}>
+				{searchOpen ? (
+					<div className="terminal-search-overlay" role="search">
+						<input
+							ref={searchInputRef}
+							type="text"
+							className="terminal-search-input"
+							value={searchQuery}
+							onChange={(event) => handleSearchChange(event.target.value)}
+							onKeyDown={(event) => {
+								if (event.key === "Enter") {
+									event.preventDefault();
+									if (event.shiftKey) handleSearchPrev();
+									else handleSearchNext();
+									return;
+								}
+								if (event.key === "Escape") {
+									event.preventDefault();
+									closeSearch();
+								}
+							}}
+							placeholder="Find"
+							spellCheck={false}
+						/>
+						<span className="terminal-search-count" aria-live="polite">
+							{searchMatchState.total === 0 ? "0 of 0" : `${Math.max(searchMatchState.current, 1)} of ${searchMatchState.total}`}
+						</span>
+						<button type="button" className="terminal-search-nav" onClick={handleSearchPrev} aria-label="Previous match">↑</button>
+						<button type="button" className="terminal-search-nav" onClick={handleSearchNext} aria-label="Next match">↓</button>
+						<button type="button" className="terminal-search-close" onClick={closeSearch} aria-label="Close search">×</button>
+					</div>
+				) : null}
 				<div ref={terminalRef} className="terminal-mount" />
 			</div>
 
@@ -793,55 +857,338 @@ function EditorTabSurface({
 
 function MarkdownTabSurface({
 	tab,
-	onOpenFile,
+	onUpdateTab,
 }: {
 	tab: Extract<PaneTabModel, { kind: "markdown" }>;
-	onOpenFile: (filePath: string) => void;
+	onUpdateTab: (tabId: string, updater: (tab: PaneTabModel) => PaneTabModel) => void;
 }) {
-	const baseDir = useMemo(() => dirname(tab.filePath), [tab.filePath]);
+	const editorRootRef = useRef<HTMLDivElement | null>(null);
+	const editorRef = useRef<{ destroy: () => Promise<unknown> } | null>(null);
+	const onUpdateTabRef = useRef(onUpdateTab);
+	const markdownContentRef = useRef(tab.content);
+	const [saveMessage, setSaveMessage] = useState<string | null>(null);
+	const [initError, setInitError] = useState<string | null>(null);
+
+	useEffect(() => {
+		onUpdateTabRef.current = onUpdateTab;
+	}, [onUpdateTab]);
+
+	useEffect(() => {
+		markdownContentRef.current = tab.content;
+	}, [tab.content]);
+
+	const saveMarkdown = useCallback(async () => {
+		if (typeof window === "undefined" || typeof window.mosaic === "undefined") return;
+		try {
+			const nextContent = markdownContentRef.current;
+			await window.mosaic.writeFile(tab.filePath, nextContent);
+			onUpdateTabRef.current(tab.id, (current) => {
+				if (current.kind !== "markdown") return current;
+				return {
+					...current,
+					savedContent: current.content,
+					dirty: false,
+					message: "Saved",
+				};
+			});
+			setSaveMessage(`Saved ${new Date().toLocaleTimeString()}`);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : "Failed to save file.";
+			onUpdateTabRef.current(tab.id, (current) => (current.kind === "markdown" ? { ...current, message } : current));
+			setSaveMessage(message);
+		}
+	}, [tab.filePath, tab.id]);
+
+	useEffect(() => {
+		const root = editorRootRef.current;
+		if (!root) return;
+		let disposed = false;
+		setInitError(null);
+		root.innerHTML = "";
+
+		void (async () => {
+			try {
+				const [{ Editor, defaultValueCtx, rootCtx }, { commonmark }, { listener, listenerCtx }, { nord }] = await Promise.all([
+					import("@milkdown/core"),
+					import("@milkdown/preset-commonmark"),
+					import("@milkdown/plugin-listener"),
+					import("@milkdown/theme-nord"),
+				]);
+				if (disposed) return;
+
+				const editor = Editor.make()
+					.use(commonmark)
+					.use(listener)
+					.config(nord)
+					.config((ctx) => {
+						ctx.set(rootCtx, root);
+						ctx.set(defaultValueCtx, tab.content);
+						ctx.get(listenerCtx).markdownUpdated((_ctx, markdown) => {
+							markdownContentRef.current = markdown;
+							onUpdateTabRef.current(tab.id, (current) => {
+								if (current.kind !== "markdown") return current;
+								if (current.content === markdown) return current;
+								return {
+									...current,
+									content: markdown,
+									dirty: markdown !== current.savedContent,
+									message: undefined,
+								};
+							});
+						});
+					});
+
+				await editor.create();
+				if (disposed) {
+					await editor.destroy();
+					return;
+				}
+				editorRef.current = editor;
+			} catch (error) {
+				if (disposed) return;
+				setInitError(error instanceof Error ? error.message : "Failed to initialize markdown editor.");
+			}
+		})();
+
+		return () => {
+			disposed = true;
+			const current = editorRef.current;
+			editorRef.current = null;
+			if (current) void current.destroy();
+		};
+	}, [tab.id]);
+
+	useEffect(() => {
+		if (!saveMessage) return;
+		const timer = window.setTimeout(() => setSaveMessage(null), 1400);
+		return () => window.clearTimeout(timer);
+	}, [saveMessage]);
+
+	useEffect(() => {
+		const handleKeyDown = (event: KeyboardEvent) => {
+			if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "s") return;
+			const root = editorRootRef.current;
+			if (!root) return;
+			if (!root.contains(document.activeElement)) return;
+			event.preventDefault();
+			void saveMarkdown();
+		};
+		window.addEventListener("keydown", handleKeyDown);
+		return () => window.removeEventListener("keydown", handleKeyDown);
+	}, [saveMarkdown]);
 
 	return (
-		<div className="pane-tab-surface active">
-			<div className="markdown-surface">
-				<div className="markdown-meta-row" title={tab.filePath}>{tab.filePath}</div>
-				<div className="markdown-content markdown-body">
-					<ReactMarkdown
-						remarkPlugins={[remarkGfm]}
-						rehypePlugins={[rehypeHighlight]}
-						components={{
-							a: ({ href, children, ...props }) => {
-								if (!href) return <a {...props}>{children}</a>;
-								if (isExternalUrl(href)) {
-									return (
-										<a href={href} target="_blank" rel="noreferrer" {...props}>
-											{children}
-										</a>
-									);
-								}
-								const localPath = resolveLocalPath(`${baseDir}/_`, href);
-								return (
-									<a
-										href={toFileUrl(localPath)}
-										onClick={(event) => {
-											event.preventDefault();
-											onOpenFile(localPath);
-										}}
-										{...props}
-									>
-										{children}
-									</a>
-								);
-							},
-							img: ({ src, alt, ...props }) => {
-								if (!src) return null;
-								const resolvedSrc = isExternalUrl(src) ? src : toFileUrl(resolveLocalPath(`${baseDir}/_`, src));
-								return <img src={resolvedSrc} alt={alt ?? ""} {...props} />;
-							},
-						}}
-					>
-						{tab.content}
-					</ReactMarkdown>
+		<div className="pane-tab-surface active tw-flex tw-min-h-0 tw-flex-1">
+			<div className="markdown-surface milkdown-surface tw-flex tw-min-h-0 tw-flex-1 tw-flex-col">
+				<div className="markdown-meta-row" title={tab.filePath}>
+					<span className="editor-path">{tab.filePath}</span>
+					<button type="button" className="editor-save-button" onClick={() => void saveMarkdown()} disabled={!tab.dirty}>
+						Save
+					</button>
 				</div>
+				<div ref={editorRootRef} className="milkdown-editor-root" />
+				{initError ? <div className="editor-save-message">{initError}</div> : null}
+				{saveMessage ? <div className="editor-save-message">{saveMessage}</div> : null}
+			</div>
+		</div>
+	);
+}
+
+function ImageTabSurface({ tab }: { tab: ImageTabModel }) {
+	const [scale, setScale] = useState(1);
+	const [offset, setOffset] = useState({ x: 0, y: 0 });
+	const [imageSrc, setImageSrc] = useState<string | null>(null);
+	const [loadError, setLoadError] = useState<string | null>(null);
+	const panRef = useRef<{ startX: number; startY: number; originX: number; originY: number } | null>(null);
+
+	useEffect(() => {
+		let cancelled = false;
+		setImageSrc(null);
+		setLoadError(null);
+
+		void (async () => {
+			if (typeof window === "undefined" || typeof window.mosaic === "undefined") return;
+			try {
+				const base64 = await window.mosaic.readFileBase64(tab.filePath);
+				if (cancelled) return;
+				const mime = getMimeTypeForImage(tab.filePath);
+				setImageSrc(`data:${mime};base64,${base64}`);
+			} catch (error) {
+				if (cancelled) return;
+				setLoadError(error instanceof Error ? error.message : "Failed to load image.");
+			}
+		})();
+
+		return () => {
+			cancelled = true;
+		};
+	}, [tab.filePath]);
+
+	return (
+		<div className="pane-tab-surface active media-surface tw-flex tw-min-h-0 tw-flex-1 tw-flex-col">
+			<div className="editor-meta-row">
+				<span className="editor-path" title={tab.filePath}>{tab.filePath}</span>
+				<button type="button" className="editor-save-button" onClick={() => setScale((s) => Math.max(0.2, s - 0.1))}>-</button>
+				<button
+					type="button"
+					className="editor-save-button"
+					onClick={() => {
+						setScale(1);
+						setOffset({ x: 0, y: 0 });
+					}}
+				>
+					Reset
+				</button>
+				<button type="button" className="editor-save-button" onClick={() => setScale((s) => Math.min(8, s + 0.1))}>+</button>
+			</div>
+			<div
+				className="media-canvas"
+				onWheel={(event) => {
+					event.preventDefault();
+					setScale((current) => Math.min(8, Math.max(0.2, current + (event.deltaY < 0 ? 0.08 : -0.08))));
+				}}
+				onMouseDown={(event) => {
+					if (event.button !== 0) return;
+					panRef.current = { startX: event.clientX, startY: event.clientY, originX: offset.x, originY: offset.y };
+				}}
+				onMouseMove={(event) => {
+					const panState = panRef.current;
+					if (!panState) return;
+					setOffset({ x: panState.originX + (event.clientX - panState.startX), y: panState.originY + (event.clientY - panState.startY) });
+				}}
+				onMouseUp={() => {
+					panRef.current = null;
+				}}
+				onMouseLeave={() => {
+					panRef.current = null;
+				}}
+			>
+				{imageSrc ? (
+					<img
+						src={imageSrc}
+						alt={tab.title}
+						className="media-image"
+						style={{ transform: `translate(${offset.x}px, ${offset.y}px) scale(${scale})` }}
+						draggable={false}
+					/>
+				) : (
+					<div className="pdf-loading">{loadError ?? "Loading image…"}</div>
+				)}
+			</div>
+		</div>
+	);
+}
+
+function PdfTabSurface({ tab }: { tab: PdfTabModel }) {
+	const [numPages, setNumPages] = useState(0);
+	const [pageNumber, setPageNumber] = useState(1);
+	const [scale, setScale] = useState(1);
+	const [pdfObjectUrl, setPdfObjectUrl] = useState<string | null>(null);
+	const pdfObjectUrlRef = useRef<string | null>(null);
+	const [pdfLoadError, setPdfLoadError] = useState<string | null>(null);
+	const [pdfComponents, setPdfComponents] = useState<null | {
+		Document: (props: Record<string, unknown>) => JSX.Element;
+		Page: (props: Record<string, unknown>) => JSX.Element;
+	}>(null);
+
+	useEffect(() => {
+		let cancelled = false;
+		void (async () => {
+			try {
+				const reactPdf = await import("react-pdf");
+				reactPdf.pdfjs.GlobalWorkerOptions.workerSrc = PDF_WORKER_SRC;
+				if (cancelled) return;
+				setPdfComponents({
+					Document: reactPdf.Document as unknown as (props: Record<string, unknown>) => JSX.Element,
+					Page: reactPdf.Page as unknown as (props: Record<string, unknown>) => JSX.Element,
+				});
+			} catch (error) {
+				if (cancelled) return;
+				setPdfLoadError(error instanceof Error ? error.message : "Failed to initialize PDF viewer.");
+			}
+		})();
+		return () => {
+			cancelled = true;
+		};
+	}, []);
+
+	useEffect(() => {
+		let cancelled = false;
+		if (pdfObjectUrlRef.current) {
+			URL.revokeObjectURL(pdfObjectUrlRef.current);
+			pdfObjectUrlRef.current = null;
+		}
+		setPdfObjectUrl(null);
+		setPdfLoadError(null);
+		setNumPages(0);
+		setPageNumber(1);
+
+		void (async () => {
+			if (typeof window === "undefined" || typeof window.mosaic === "undefined") return;
+			try {
+				const base64 = await window.mosaic.readFileBase64(tab.filePath);
+				if (cancelled) return;
+				const bytes = base64ToUint8Array(base64);
+				const blob = new Blob([bytes], { type: "application/pdf" });
+				const objectUrl = URL.createObjectURL(blob);
+				pdfObjectUrlRef.current = objectUrl;
+				setPdfObjectUrl(objectUrl);
+			} catch (error) {
+				if (cancelled) return;
+				setPdfLoadError(error instanceof Error ? error.message : "Failed to load PDF.");
+			}
+		})();
+
+		return () => {
+			cancelled = true;
+			if (pdfObjectUrlRef.current) {
+				URL.revokeObjectURL(pdfObjectUrlRef.current);
+				pdfObjectUrlRef.current = null;
+			}
+		};
+	}, [tab.filePath]);
+
+	const DocumentComponent = pdfComponents?.Document;
+	const PageComponent = pdfComponents?.Page;
+
+	return (
+		<div className="pane-tab-surface active media-surface tw-flex tw-min-h-0 tw-flex-1 tw-flex-col">
+			<div className="editor-meta-row">
+				<span className="editor-path" title={tab.filePath}>{tab.filePath}</span>
+				<button type="button" className="editor-save-button" onClick={() => setPageNumber((current) => Math.max(1, current - 1))} disabled={pageNumber <= 1}>
+					Prev
+				</button>
+				<span className="editor-language-pill">{pageNumber}/{numPages || "-"}</span>
+				<button
+					type="button"
+					className="editor-save-button"
+					onClick={() => setPageNumber((current) => Math.min(numPages || 1, current + 1))}
+					disabled={numPages <= 0 || pageNumber >= numPages}
+				>
+					Next
+				</button>
+				<button type="button" className="editor-save-button" onClick={() => setScale((current) => Math.max(0.4, current - 0.1))}>-</button>
+				<button type="button" className="editor-save-button" onClick={() => setScale((current) => Math.min(3, current + 0.1))}>+</button>
+			</div>
+			<div className="pdf-canvas">
+				{pdfLoadError ? <div className="pdf-loading">{pdfLoadError}</div> : null}
+				{!pdfLoadError && DocumentComponent && PageComponent && pdfObjectUrl ? (
+					<DocumentComponent
+						file={pdfObjectUrl}
+						onLoadSuccess={({ numPages: totalPages }: { numPages: number }) => {
+							setNumPages(totalPages);
+							setPageNumber((current) => Math.min(Math.max(current, 1), totalPages));
+						}}
+						onLoadError={(error: Error) => {
+							setPdfLoadError(error.message || "Failed to load PDF.");
+						}}
+						loading={<div className="pdf-loading">Loading PDF…</div>}
+						error={<div className="pdf-loading">{pdfLoadError ?? "Failed to load PDF."}</div>}
+					>
+						<PageComponent pageNumber={pageNumber} scale={scale} />
+					</DocumentComponent>
+				) : null}
+				{!pdfLoadError && (!DocumentComponent || !PageComponent || !pdfObjectUrl) ? <div className="pdf-loading">Loading PDF…</div> : null}
 			</div>
 		</div>
 	);
@@ -861,10 +1208,13 @@ export function TerminalPane({
 	onSplitHorizontal,
 	onClose,
 	onAddTab,
+	onAddBrowserTab,
 	onSelectTab,
 	onCloseTab,
 	onMoveTab,
+	onDropTabToPane,
 	onToggleZoom,
+	onBeginShiftDrag,
 	onUpdateTabMeta,
 	onOpenFile,
 	onUpdateTab,
@@ -872,6 +1222,8 @@ export function TerminalPane({
 	const activeTab = pane.tabs.find((tab) => tab.id === pane.activeTabId) ?? pane.tabs[0];
 	const [tabDropActive, setTabDropActive] = useState(false);
 	const [draggingTabId, setDraggingTabId] = useState<string | null>(null);
+	const [paneBodyDropActive, setPaneBodyDropActive] = useState(false);
+	const [paneBodyDropPosition, setPaneBodyDropPosition] = useState<PaneDropPosition | null>(null);
 
 	const handleTabStripDragOver = useCallback(
 		(event: ReactDragEvent<HTMLDivElement>) => {
@@ -895,18 +1247,56 @@ export function TerminalPane({
 		[onMoveTab, pane.id],
 	);
 
+	const handlePaneBodyDragOver = useCallback(
+		(event: ReactDragEvent<HTMLDivElement>) => {
+			const payload = parseDraggedTab(event);
+			if (!payload) return;
+			event.preventDefault();
+			event.dataTransfer.dropEffect = "move";
+			setPaneBodyDropActive(true);
+			setPaneBodyDropPosition(resolvePaneDropPosition(event.currentTarget.getBoundingClientRect(), event.clientX, event.clientY));
+		},
+		[],
+	);
+
+	const clearPaneBodyDropState = useCallback(() => {
+		setPaneBodyDropActive(false);
+		setPaneBodyDropPosition(null);
+	}, []);
+
+	const handlePaneBodyDrop = useCallback(
+		(event: ReactDragEvent<HTMLDivElement>) => {
+			const payload = parseDraggedTab(event);
+			clearPaneBodyDropState();
+			if (!payload) return;
+			event.preventDefault();
+			const position = resolvePaneDropPosition(event.currentTarget.getBoundingClientRect(), event.clientX, event.clientY);
+			onDropTabToPane(payload.sourcePaneId, payload.tabId, position);
+		},
+		[clearPaneBodyDropState, onDropTabToPane],
+	);
+
 	const activeTabTitle = activeTab?.title ?? "Pane";
 
 	return (
 		<section
-			className={`terminal-pane ${focused ? "focused" : ""} ${zoomed ? "zoomed" : ""}`}
+			className={`terminal-pane tw-flex tw-h-full tw-min-h-0 tw-flex-col ${focused ? "focused" : ""} ${zoomed ? "zoomed" : ""}`}
 			style={{ ["--workspace-accent" as string]: accent, ["--glow-color" as string]: accent }}
 			onMouseDown={onFocus}
 		>
 			<div className="terminal-pane-accent" />
 
 			<div
-				className="pane-header pane-header-tabs"
+				className="pane-header pane-header-tabs tw-flex tw-min-w-0 tw-items-center"
+				onMouseDown={(event) => {
+					const target = event.target as HTMLElement;
+					if (target.closest("button") || target.closest('[role="button"]')) return;
+					if (event.shiftKey && event.button === 0) {
+						event.preventDefault();
+						event.stopPropagation();
+						onBeginShiftDrag(event.clientX, event.clientY);
+					}
+				}}
 				onDoubleClick={(event) => {
 					const target = event.target as HTMLElement;
 					if (target.closest("button") || target.closest('[role="button"]')) return;
@@ -914,7 +1304,7 @@ export function TerminalPane({
 				}}
 			>
 				<div
-					className={`pane-tab-strip ${tabDropActive ? "tab-drop-target" : ""}`}
+					className={`pane-tab-strip tw-flex tw-min-w-0 tw-flex-1 ${tabDropActive ? "tab-drop-target" : ""}`}
 					onDragOver={handleTabStripDragOver}
 					onDrop={handleTabStripDrop}
 					onDragLeave={(event) => {
@@ -925,7 +1315,14 @@ export function TerminalPane({
 				>
 					{pane.tabs.map((tab) => {
 						const tabStatus = getTabStatus(tab);
-						const tabTitle = tab.kind === "editor" || tab.kind === "markdown" ? tab.filePath : tab.kind === "fileTree" ? tab.rootPath : tab.title;
+						const tabTitle =
+							"filePath" in tab
+								? tab.filePath
+								: tab.kind === "fileTree"
+									? tab.rootPath
+									: tab.kind === "browser"
+										? tab.url
+										: tab.title;
 						return (
 							<button
 								key={tab.id}
@@ -941,6 +1338,7 @@ export function TerminalPane({
 								onDragEnd={() => {
 									setDraggingTabId(null);
 									setTabDropActive(false);
+									clearPaneBodyDropState();
 								}}
 								onClick={() => onSelectTab(tab.id)}
 								title={tabTitle}
@@ -948,7 +1346,7 @@ export function TerminalPane({
 							>
 								<span className={`status-dot pane-tab-status status-${tabStatus}`} />
 								<span className="pane-tab-title">{tab.title}</span>
-								{isEditorTab(tab) && tab.dirty ? <span className="pane-tab-dirty" title="Unsaved changes">●</span> : null}
+								{(tab.kind === "editor" || tab.kind === "markdown") && tab.dirty ? <span className="pane-tab-dirty" title="Unsaved changes">●</span> : null}
 								<span
 									className="pane-tab-close"
 									role="button"
@@ -972,6 +1370,9 @@ export function TerminalPane({
 					})}
 					<button type="button" className="pane-tab-add" onClick={onAddTab} aria-label="Open a new terminal tab">
 						+
+					</button>
+					<button type="button" className="pane-tab-add browser" onClick={onAddBrowserTab} aria-label="Open a new browser tab">
+						◉
 					</button>
 				</div>
 
@@ -1009,7 +1410,25 @@ export function TerminalPane({
 				</div>
 			</div>
 
-			<div className="pane-body">
+			<div
+				className="pane-body tw-flex-1 tw-min-h-0"
+				onDragOver={handlePaneBodyDragOver}
+				onDrop={handlePaneBodyDrop}
+				onDragLeave={(event) => {
+					const nextTarget = event.relatedTarget as Node | null;
+					if (nextTarget && event.currentTarget.contains(nextTarget)) return;
+					clearPaneBodyDropState();
+				}}
+			>
+				{paneBodyDropActive ? (
+					<div className="pane-drop-zones" aria-hidden="true">
+						<div className={`pane-drop-zone left ${paneBodyDropPosition === "left" ? "active" : ""}`} />
+						<div className={`pane-drop-zone right ${paneBodyDropPosition === "right" ? "active" : ""}`} />
+						<div className={`pane-drop-zone top ${paneBodyDropPosition === "top" ? "active" : ""}`} />
+						<div className={`pane-drop-zone bottom ${paneBodyDropPosition === "bottom" ? "active" : ""}`} />
+						<div className={`pane-drop-zone center ${paneBodyDropPosition === "center" ? "active" : ""}`} />
+					</div>
+				) : null}
 				{activeTab.kind === "terminal" ? (
 					<TerminalTabSurface
 						key={activeTab.id}
@@ -1023,7 +1442,10 @@ export function TerminalPane({
 				) : null}
 				{activeTab.kind === "fileTree" ? <FileTreeTabSurface tab={activeTab} onOpenFile={onOpenFile} /> : null}
 				{activeTab.kind === "editor" ? <EditorTabSurface tab={activeTab} theme={theme} onUpdateTab={onUpdateTab} /> : null}
-				{activeTab.kind === "markdown" ? <MarkdownTabSurface tab={activeTab} onOpenFile={onOpenFile} /> : null}
+				{activeTab.kind === "markdown" ? <MarkdownTabSurface tab={activeTab} onUpdateTab={onUpdateTab} /> : null}
+				{activeTab.kind === "image" ? <ImageTabSurface tab={activeTab} /> : null}
+				{activeTab.kind === "pdf" ? <PdfTabSurface tab={activeTab} /> : null}
+				{activeTab.kind === "browser" ? <BrowserPane tab={activeTab} theme={theme} onUpdateTab={onUpdateTab} /> : null}
 			</div>
 		</section>
 	);

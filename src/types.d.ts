@@ -9,6 +9,12 @@ interface DirectoryEntry {
 }
 
 declare global {
+	namespace JSX {
+		interface IntrinsicElements {
+			webview: import("react").DetailedHTMLProps<import("react").HTMLAttributes<HTMLElement>, HTMLElement> & Record<string, unknown>;
+		}
+	}
+
 	interface Window {
 		mosaic: {
 			createTerminal: (options?: { cwd?: string }) => Promise<TerminalSessionMeta>;
@@ -19,7 +25,13 @@ declare global {
 			inspectWorkspace: (directoryPath: string) => Promise<WorkspaceSelection>;
 			readDirectory: (workspacePath: string, directoryPath: string) => Promise<DirectoryEntry[]>;
 			readFile: (filePath: string) => Promise<string>;
+			readFileBase64: (filePath: string) => Promise<string>;
 			writeFile: (filePath: string, contents: string) => Promise<void>;
+			getBrowserCdpTarget: (
+				webContentsId: number,
+				url?: string,
+				title?: string,
+			) => Promise<{ id: string; webSocketDebuggerUrl: string; url: string; title: string } | null>;
 			updateTitleBarOverlay: (payload: { backgroundColor: string; overlayColor: string; symbolColor: string }) => Promise<void>;
 			subscribeTerminal: (
 				id: string,

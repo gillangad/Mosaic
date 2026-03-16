@@ -1,8 +1,11 @@
 import type { LayoutNode, PaneLayoutNode, PaneModel, PaneStatus, PaneTabModel, SplitDirection, SplitLayoutNode, TerminalTabModel } from "./models";
 import {
+	createBrowserTab,
 	createEditorTab,
 	createFileTreeTab,
+	createImageTab,
 	createMarkdownTab,
+	createPdfTab,
 	createTerminalTab,
 	getMonacoLanguage,
 	isTerminalTab,
@@ -18,6 +21,11 @@ export const WIDTH_UNIT_BASE = 100;
 const DEFAULT_WIDTH_UNITS = WIDTH_UNIT_BASE;
 const APPENDED_PANE_WIDTH_UNITS = WIDTH_UNIT_BASE / 2;
 export const COLUMN_INSERT_WIDTH_UNITS = APPENDED_PANE_WIDTH_UNITS;
+const MAX_BRANCH_EXPAND_UNITS = WIDTH_UNIT_BASE;
+
+function getResizeCap() {
+	return MAX_BRANCH_EXPAND_UNITS;
+}
 
 function clampWidthUnits(value: number) {
 	return Math.max(0.01, value);
@@ -137,9 +145,10 @@ export function findTabById(node: LayoutNode, tabId: string): { paneId: string; 
 export function findTabByFilePath(node: LayoutNode, filePath: string): { paneId: string; tabId: string } | null {
 	const normalizedPath = normalizeFilePath(filePath);
 	if (node.type === "pane") {
-		const tab = node.pane.tabs.find((item) =>
-			(item.kind === "editor" || item.kind === "markdown") && normalizeFilePath(item.filePath) === normalizedPath,
-		);
+		const tab = node.pane.tabs.find((item) => {
+			if (!("filePath" in item)) return false;
+			return normalizeFilePath(item.filePath) === normalizedPath;
+		});
 		return tab ? { paneId: node.pane.id, tabId: tab.id } : null;
 	}
 
@@ -254,12 +263,35 @@ export function addTabToPane(node: LayoutNode, paneId: string, workspacePath: st
 	});
 }
 
+export function addBrowserTabToPane(node: LayoutNode, paneId: string, initialUrl = "about:blank"): LayoutNode {
+	return mapPane(node, paneId, (pane) => {
+		const nextTab = createBrowserTab(initialUrl);
+		return {
+			...pane,
+			tabs: [...pane.tabs, nextTab],
+			activeTabId: nextTab.id,
+		};
+	});
+}
+
 export function addTabModelToPane(node: LayoutNode, paneId: string, tab: PaneTabModel): LayoutNode {
 	return mapPane(node, paneId, (pane) => ({
 		...pane,
 		tabs: [...pane.tabs, tab],
 		activeTabId: tab.id,
 	}));
+}
+
+export function replacePaneTabs(node: LayoutNode, paneId: string, tabs: PaneTabModel[], activeTabId?: string): LayoutNode {
+	return mapPane(node, paneId, (pane) => {
+		const safeTabs = tabs.length > 0 ? tabs : pane.tabs;
+		const nextActiveTabId = activeTabId && safeTabs.some((tab) => tab.id === activeTabId) ? activeTabId : safeTabs[0].id;
+		return {
+			...pane,
+			tabs: safeTabs,
+			activeTabId: nextActiveTabId,
+		};
+	});
 }
 
 export function appendPaneToRight(node: LayoutNode, workspacePath: string): LayoutNode {
@@ -534,6 +566,11 @@ function collectRootColumns(node: LayoutNode, result: LayoutNode[]) {
 	result.push(node);
 }
 
+function columnContainsPane(node: LayoutNode, paneId: string): boolean {
+	if (node.type === "pane") return node.pane.id === paneId;
+	return columnContainsPane(node.first, paneId) || columnContainsPane(node.second, paneId);
+}
+
 function buildRootColumns(columns: LayoutNode[]): LayoutNode {
 	if (columns.length === 1) {
 		const widthUnits = getNodeWidthUnits(columns[0]);
@@ -567,11 +604,27 @@ export function movePaneToColumnIndex(node: LayoutNode, sourcePaneId: string, co
 	const columns: LayoutNode[] = [];
 	collectRootColumns(layoutWithoutSource, columns);
 	const clampedIndex = Math.max(0, Math.min(columnIndex, columns.length));
-	if (clampedIndex === 0) return movePaneToOuterColumn(node, sourcePaneId, "left");
-	if (clampedIndex === columns.length) return movePaneToOuterColumn(node, sourcePaneId, "right");
+	if (clampedIndex === 0) return detachPaneToSide(node, sourcePaneId, "left");
+	if (clampedIndex === columns.length) return detachPaneToSide(node, sourcePaneId, "right");
 
 	const nextColumns = [...columns];
 	nextColumns.splice(clampedIndex, 0, createPaneNodeFromModel(sourcePane, APPENDED_PANE_WIDTH_UNITS));
+	return buildRootColumns(nextColumns);
+}
+
+export function moveColumnContainingPane(node: LayoutNode, paneId: string, delta: -1 | 1): LayoutNode {
+	const columns: LayoutNode[] = [];
+	collectRootColumns(node, columns);
+	if (columns.length < 2) return node;
+	const sourceIndex = columns.findIndex((column) => columnContainsPane(column, paneId));
+	if (sourceIndex < 0) return node;
+	const targetIndex = Math.max(0, Math.min(columns.length - 1, sourceIndex + delta));
+	if (targetIndex === sourceIndex) return node;
+	const nextColumns = [...columns];
+	const [movedColumn] = nextColumns.splice(sourceIndex, 1);
+	if (!movedColumn) return node;
+	const insertionIndex = sourceIndex < targetIndex ? targetIndex : targetIndex;
+	nextColumns.splice(insertionIndex, 0, movedColumn);
 	return buildRootColumns(nextColumns);
 }
 
@@ -680,7 +733,8 @@ export function updateSplitRatio(node: LayoutNode, splitId: string, ratio: numbe
 		if (node.direction === "vertical") {
 			const requestedRatio = Number.isFinite(ratio) ? ratio : node.ratio;
 			const currentSecondWidthUnits = getBranchWidthUnits(node, "second");
-			const nextFirstWidthUnits = clampWidthUnits(widthUnits * requestedRatio);
+			const requestedFirstWidthUnits = clampWidthUnits(widthUnits * requestedRatio);
+			const nextFirstWidthUnits = Math.min(getResizeCap(), requestedFirstWidthUnits);
 			const nextWidthUnits = nextFirstWidthUnits + currentSecondWidthUnits;
 			const normalizedRatio = clampRatio(nextFirstWidthUnits / nextWidthUnits);
 			return {
@@ -766,11 +820,17 @@ function resizeVerticalSplitPreserveSibling(
 	let nextSecondWidth = secondWidth;
 
 	if (branch === "first") {
-		nextFirstWidth = direction === "right" ? firstWidth + deltaUnits : firstWidth - deltaUnits;
-		nextFirstWidth = Math.max(minBranchWidth, nextFirstWidth);
+		const requestedFirstWidth = direction === "right" ? firstWidth + deltaUnits : firstWidth - deltaUnits;
+		nextFirstWidth = Math.max(minBranchWidth, requestedFirstWidth);
+		if (direction === "right") {
+			nextFirstWidth = Math.min(getResizeCap(), nextFirstWidth);
+		}
 	} else {
-		nextSecondWidth = direction === "left" ? secondWidth + deltaUnits : secondWidth - deltaUnits;
-		nextSecondWidth = Math.max(minBranchWidth, nextSecondWidth);
+		const requestedSecondWidth = direction === "left" ? secondWidth + deltaUnits : secondWidth - deltaUnits;
+		nextSecondWidth = Math.max(minBranchWidth, requestedSecondWidth);
+		if (direction === "left") {
+			nextSecondWidth = Math.min(getResizeCap(), nextSecondWidth);
+		}
 	}
 
 	if (Math.abs(nextFirstWidth - firstWidth) < 1e-6 && Math.abs(nextSecondWidth - secondWidth) < 1e-6) return null;
@@ -864,7 +924,10 @@ function resizeVerticalSplitKeepSecondWidth(node: SplitLayoutNode, deltaRatio: n
 	const firstWidth = getBranchWidthUnits(node, "first");
 	const secondWidth = getBranchWidthUnits(node, "second");
 	const minBranchWidth = Math.max(0.08, splitWidth * 0.08);
-	const nextFirstWidth = Math.max(minBranchWidth, firstWidth + deltaUnits);
+	const requestedFirstWidth = Math.max(minBranchWidth, firstWidth + deltaUnits);
+	const nextFirstWidth = deltaUnits > 0
+		? Math.min(getResizeCap(), requestedFirstWidth)
+		: requestedFirstWidth;
 	if (Math.abs(nextFirstWidth - firstWidth) < 1e-6) return null;
 
 	const nextWidthUnits = nextFirstWidth + secondWidth;
@@ -889,7 +952,10 @@ function resizeVerticalSplitKeepFirstWidth(node: SplitLayoutNode, deltaRatio: nu
 	const firstWidth = getBranchWidthUnits(node, "first");
 	const secondWidth = getBranchWidthUnits(node, "second");
 	const minBranchWidth = Math.max(0.08, splitWidth * 0.08);
-	const nextSecondWidth = Math.max(minBranchWidth, secondWidth + deltaUnits);
+	const requestedSecondWidth = Math.max(minBranchWidth, secondWidth + deltaUnits);
+	const nextSecondWidth = deltaUnits > 0
+		? Math.min(getResizeCap(), requestedSecondWidth)
+		: requestedSecondWidth;
 	if (Math.abs(nextSecondWidth - secondWidth) < 1e-6) return null;
 
 	const nextWidthUnits = firstWidth + nextSecondWidth;
@@ -957,6 +1023,47 @@ export function resizeFromPane(root: LayoutNode, paneId: string, direction: Focu
 	return root;
 }
 
+function capSinglePaneWidthUnits(node: LayoutNode): LayoutNode {
+	if (node.type === "pane") {
+		return {
+			...node,
+			widthUnits: Math.min(getNodeWidthUnits(node), MAX_BRANCH_EXPAND_UNITS),
+		};
+	}
+
+	if (node.direction === "horizontal") {
+		const cappedWidthUnits = Math.min(getNodeWidthUnits(node), MAX_BRANCH_EXPAND_UNITS);
+		const nextRatio = clampRatio(node.ratio ?? 0.5);
+		const nextFirst = capSinglePaneWidthUnits(node.first);
+		const nextSecond = capSinglePaneWidthUnits(node.second);
+		return {
+			...node,
+			ratio: nextRatio,
+			widthUnits: cappedWidthUnits,
+			first: resizeLayoutWidth(nextFirst, cappedWidthUnits),
+			second: resizeLayoutWidth(nextSecond, cappedWidthUnits),
+		};
+	}
+
+	const nextFirst = capSinglePaneWidthUnits(node.first);
+	const nextSecond = capSinglePaneWidthUnits(node.second);
+	const firstWidthUnits = getNodeWidthUnits(nextFirst);
+	const secondWidthUnits = getNodeWidthUnits(nextSecond);
+	const totalWidthUnits = firstWidthUnits + secondWidthUnits;
+	const safeRatio = clampRatio(firstWidthUnits / Math.max(totalWidthUnits, 0.01));
+	return {
+		...node,
+		ratio: safeRatio,
+		widthUnits: totalWidthUnits,
+		first: resizeLayoutWidth(nextFirst, firstWidthUnits),
+		second: resizeLayoutWidth(nextSecond, secondWidthUnits),
+	};
+}
+
+export function enforcePaneWidthCap(node: LayoutNode): LayoutNode {
+	return capSinglePaneWidthUnits(node);
+}
+
 function rehydrateTab(rawTab: unknown, workspacePath: string): PaneTabModel {
 	if (!rawTab || typeof rawTab !== "object") return createTerminalTab(workspacePath);
 	const tab = rawTab as Partial<PaneTabModel> & { kind?: string };
@@ -1002,10 +1109,46 @@ function rehydrateTab(rawTab: unknown, workspacePath: string): PaneTabModel {
 	if (tab.kind === "markdown") {
 		const filePath = typeof (tab as { filePath?: string }).filePath === "string" ? (tab as { filePath: string }).filePath : "";
 		const content = typeof (tab as { content?: string }).content === "string" ? (tab as { content: string }).content : "";
+		const savedContent = typeof (tab as { savedContent?: string }).savedContent === "string"
+			? (tab as { savedContent: string }).savedContent
+			: content;
 		return {
 			...createMarkdownTab(filePath, content),
 			id: typeof tab.id === "string" ? tab.id : crypto.randomUUID(),
 			title: typeof tab.title === "string" ? tab.title : createMarkdownTab(filePath, content).title,
+			savedContent,
+			dirty: typeof (tab as { dirty?: boolean }).dirty === "boolean" ? (tab as { dirty: boolean }).dirty : content !== savedContent,
+			message: typeof (tab as { message?: string }).message === "string" ? (tab as { message: string }).message : undefined,
+		};
+	}
+
+	if (tab.kind === "image") {
+		const filePath = typeof (tab as { filePath?: string }).filePath === "string" ? (tab as { filePath: string }).filePath : "";
+		return {
+			...createImageTab(filePath),
+			id: typeof tab.id === "string" ? tab.id : crypto.randomUUID(),
+			title: typeof tab.title === "string" ? tab.title : createImageTab(filePath).title,
+		};
+	}
+
+	if (tab.kind === "pdf") {
+		const filePath = typeof (tab as { filePath?: string }).filePath === "string" ? (tab as { filePath: string }).filePath : "";
+		return {
+			...createPdfTab(filePath),
+			id: typeof tab.id === "string" ? tab.id : crypto.randomUUID(),
+			title: typeof tab.title === "string" ? tab.title : createPdfTab(filePath).title,
+		};
+	}
+
+	if (tab.kind === "browser") {
+		const url = typeof (tab as { url?: string }).url === "string" && (tab as { url: string }).url.trim().length > 0
+			? (tab as { url: string }).url
+			: "about:blank";
+		return {
+			...createBrowserTab(url),
+			id: typeof tab.id === "string" ? tab.id : crypto.randomUUID(),
+			title: typeof tab.title === "string" && tab.title.trim().length > 0 ? tab.title : "Browser",
+			url,
 		};
 	}
 
@@ -1016,31 +1159,36 @@ export function rehydrateLayout(
 	node: LayoutNode | undefined,
 	workspacePath: string,
 	inheritedWidthUnits = DEFAULT_WIDTH_UNITS,
+	isRoot = true,
 ): LayoutNode {
-	if (!node) return createPaneNode(workspacePath, createPaneModel(workspacePath), inheritedWidthUnits);
+	const hydrated = (() => {
+		if (!node) return createPaneNode(workspacePath, createPaneModel(workspacePath), inheritedWidthUnits);
 
-	if (node.type === "pane") {
-		const tabs = node.pane.tabs?.length ? node.pane.tabs.map((tab) => rehydrateTab(tab, workspacePath)) : [createTerminalTab(workspacePath)];
+		if (node.type === "pane") {
+			const tabs = node.pane.tabs?.length ? node.pane.tabs.map((tab) => rehydrateTab(tab, workspacePath)) : [createTerminalTab(workspacePath)];
+
+			return {
+				...node,
+				widthUnits: clampWidthUnits(node.widthUnits ?? inheritedWidthUnits),
+				pane: {
+					...node.pane,
+					tabs,
+					activeTabId: tabs.some((tab) => tab.id === node.pane.activeTabId) ? node.pane.activeTabId : tabs[0].id,
+				},
+			};
+		}
+
+		const ratio = clampRatio(node.ratio ?? 0.5);
+		const widthUnits = clampWidthUnits(node.widthUnits ?? inheritedWidthUnits);
 
 		return {
 			...node,
-			widthUnits: clampWidthUnits(node.widthUnits ?? inheritedWidthUnits),
-			pane: {
-				...node.pane,
-				tabs,
-				activeTabId: tabs.some((tab) => tab.id === node.pane.activeTabId) ? node.pane.activeTabId : tabs[0].id,
-			},
+			ratio,
+			widthUnits,
+			first: rehydrateLayout(node.first, workspacePath, getBranchWidthUnits({ ...node, ratio, widthUnits }, "first"), false),
+			second: rehydrateLayout(node.second, workspacePath, getBranchWidthUnits({ ...node, ratio, widthUnits }, "second"), false),
 		};
-	}
+	})();
 
-	const ratio = clampRatio(node.ratio ?? 0.5);
-	const widthUnits = clampWidthUnits(node.widthUnits ?? inheritedWidthUnits);
-
-	return {
-		...node,
-		ratio,
-		widthUnits,
-		first: rehydrateLayout(node.first, workspacePath, getBranchWidthUnits({ ...node, ratio, widthUnits }, "first")),
-		second: rehydrateLayout(node.second, workspacePath, getBranchWidthUnits({ ...node, ratio, widthUnits }, "second")),
-	};
+	return isRoot ? enforcePaneWidthCap(hydrated) : hydrated;
 }

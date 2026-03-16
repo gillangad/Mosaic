@@ -46,6 +46,8 @@ if (process.platform === "linux") {
 	app.disableHardwareAcceleration();
 }
 
+app.commandLine.appendSwitch("remote-debugging-port", "9222");
+
 function resolveWindowsDefaultShell() {
 	const wherePwsh = spawnSync("where.exe", ["pwsh.exe"], {
 		encoding: "utf8",
@@ -173,13 +175,9 @@ function isHardExcluded(relativePath) {
 	return segments.some((segment) => FILE_TREE_EXCLUDED_SEGMENTS.has(segment));
 }
 
-function isIgnoredPath(matcher, relativePath, isDirectory) {
+function isIgnoredPath(_matcher, relativePath, _isDirectory) {
 	if (!relativePath) return false;
 	if (isHardExcluded(relativePath)) return true;
-	if (!matcher) return false;
-	const normalizedRelativePath = normalizeRelativePath(relativePath);
-	if (matcher.ignores(normalizedRelativePath)) return true;
-	if (isDirectory && matcher.ignores(`${normalizedRelativePath}/`)) return true;
 	return false;
 }
 
@@ -215,6 +213,71 @@ async function listWorkspaceDirectory(workspacePath, directoryPath) {
 	return visibleEntries;
 }
 
+async function listCdpTargets() {
+	try {
+		const response = await fetch("http://127.0.0.1:9222/json/list");
+		if (!response.ok) return [];
+		const targets = await response.json();
+		return Array.isArray(targets) ? targets : [];
+	} catch {
+		return [];
+	}
+}
+
+function parseTargetDescription(target) {
+	if (!target || typeof target.description !== "string") return null;
+	try {
+		const parsed = JSON.parse(target.description);
+		return parsed && typeof parsed === "object" ? parsed : null;
+	} catch {
+		return null;
+	}
+}
+
+async function resolveBrowserCdpTarget(webContentsId, url, title) {
+	const targets = await listCdpTargets();
+	if (!Number.isFinite(webContentsId) || webContentsId <= 0) return null;
+
+	for (const target of targets) {
+		if (!target || typeof target !== "object") continue;
+		const description = parseTargetDescription(target);
+		if (description && Number(description.webContentsId) === webContentsId) {
+			return {
+				id: String(target.id ?? ""),
+				webSocketDebuggerUrl: String(target.webSocketDebuggerUrl ?? ""),
+				url: String(target.url ?? ""),
+				title: String(target.title ?? ""),
+			};
+		}
+	}
+
+	if (typeof url === "string" && url.trim().length > 0) {
+		const byUrl = targets.find((target) => target?.url === url && typeof target?.webSocketDebuggerUrl === "string");
+		if (byUrl) {
+			return {
+				id: String(byUrl.id ?? ""),
+				webSocketDebuggerUrl: String(byUrl.webSocketDebuggerUrl ?? ""),
+				url: String(byUrl.url ?? ""),
+				title: String(byUrl.title ?? ""),
+			};
+		}
+	}
+
+	if (typeof title === "string" && title.trim().length > 0) {
+		const byTitle = targets.find((target) => target?.title === title && typeof target?.webSocketDebuggerUrl === "string");
+		if (byTitle) {
+			return {
+				id: String(byTitle.id ?? ""),
+				webSocketDebuggerUrl: String(byTitle.webSocketDebuggerUrl ?? ""),
+				url: String(byTitle.url ?? ""),
+				title: String(byTitle.title ?? ""),
+			};
+		}
+	}
+
+	return null;
+}
+
 function createWindow() {
 	const isMac = process.platform === "darwin";
 
@@ -238,6 +301,7 @@ function createWindow() {
 			contextIsolation: true,
 			nodeIntegration: false,
 			sandbox: false,
+			webviewTag: true,
 		},
 	});
 
@@ -263,9 +327,16 @@ function createPtySession(options = {}) {
 	const shell = getDefaultShell();
 	const cwd = options.cwd || os.homedir();
 
+	const localBinPath = path.join(__dirname, "..", "node_modules", ".bin");
+	const basePath = process.env.PATH ?? process.env.Path ?? "";
+	const mergedPath = [localBinPath, basePath].filter(Boolean).join(path.delimiter);
 	const spawnOptions = {
 		name: "xterm-256color",
-		env: process.env,
+		env: {
+			...process.env,
+			PATH: mergedPath,
+			Path: mergedPath,
+		},
 		cols: 120,
 		rows: 36,
 	};
@@ -345,11 +416,27 @@ ipcMain.handle("fs:readFile", async (_event, filePath) => {
 	return readFile(filePath, "utf8");
 });
 
+ipcMain.handle("fs:readFileBase64", async (_event, filePath) => {
+	if (typeof filePath !== "string" || filePath.length === 0) {
+		throw new Error("filePath is required.");
+	}
+	const buffer = await readFile(filePath);
+	return buffer.toString("base64");
+});
+
 ipcMain.handle("fs:writeFile", async (_event, payload) => {
 	if (!payload || typeof payload !== "object" || typeof payload.filePath !== "string") {
 		throw new Error("Invalid write payload.");
 	}
 	await writeFile(payload.filePath, typeof payload.contents === "string" ? payload.contents : "", "utf8");
+});
+
+ipcMain.handle("browser:getCdpTarget", async (_event, payload) => {
+	if (!payload || typeof payload !== "object") return null;
+	const webContentsId = Number(payload.webContentsId ?? 0);
+	const url = typeof payload.url === "string" ? payload.url : "";
+	const title = typeof payload.title === "string" ? payload.title : "";
+	return resolveBrowserCdpTarget(webContentsId, url, title);
 });
 
 ipcMain.handle("window:updateTitleBarOverlay", (event, payload = {}) => {

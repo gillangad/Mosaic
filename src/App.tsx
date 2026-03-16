@@ -1,10 +1,9 @@
 import { AnimatePresence, motion, Reorder, useDragControls } from "framer-motion";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent as ReactDragEvent } from "react";
 import { createPortal } from "react-dom";
 import { WorkspaceView } from "./WorkspaceView";
 import { FileTreeSidebar } from "./components/FileTreeSidebar";
 import {
-	addTabModelToPane,
 	addTabToPane,
 	appendPaneToRight,
 	closeTab,
@@ -15,7 +14,9 @@ import {
 	findPaneById,
 	findTabByFilePath,
 	getAllTabIds,
+	moveColumnContainingPane,
 	rehydrateLayout,
+	replacePaneTabs,
 	resizeFromPane,
 	setActiveTab,
 	splitNode,
@@ -24,7 +25,19 @@ import {
 } from "./core/layout";
 import type { FocusDirection } from "./core/layout";
 import type { LayoutNode, PaneTabModel, WorkspaceModel, WorkspaceSelection } from "./core/models";
-import { createEditorTab, createMarkdownTab, createTerminalTab, isMarkdownPath, isTerminalTab, normalizeFilePath } from "./core/pane-tabs";
+import {
+	createBrowserTab,
+	createEditorTab,
+	createImageTab,
+	createMarkdownTab,
+	createPdfTab,
+	createTerminalTab,
+	isImagePath,
+	isMarkdownPath,
+	isPdfPath,
+	isTerminalTab,
+	normalizeFilePath,
+} from "./core/pane-tabs";
 import type { MosaicTheme } from "./core/themes";
 import { accentPalette, defaultThemeId, themeIds, themes } from "./core/themes";
 import { getWorkspaceDisplayName, getWorkspaceTabLabel, serializeWorkspaceState } from "./core/workspaces";
@@ -37,6 +50,16 @@ type SettingsView = "root" | "skins" | "shortcuts";
 interface ShortcutDefinition {
 	action: string;
 	keys: string;
+}
+
+interface CommandAction {
+	id: string;
+	label: string;
+	category: string;
+	shortcut?: string;
+	keywords?: string;
+	disabled?: boolean;
+	run: () => void;
 }
 
 const STORAGE_KEYS = {
@@ -63,18 +86,164 @@ const SHORTCUTS: ShortcutDefinition[] = [
 	{ action: "Close tab", keys: "Ctrl Shift W" },
 	{ action: "Next tab", keys: "Ctrl Tab" },
 	{ action: "Previous tab", keys: "Ctrl Shift Tab" },
-	{ action: "Focus pane", keys: "Ctrl Shift Arrow" },
+	{ action: "Focus pane", keys: "Ctrl Arrow" },
+	{ action: "Move column", keys: "Shift Left / Right" },
+	{ action: "Move pane with mouse", keys: "Shift Drag" },
 	{ action: "Resize pane", keys: "Ctrl Alt Arrow" },
 	{ action: "Toggle pane zoom", keys: "Ctrl Shift M" },
 	{ action: "Previous workspace", keys: "Alt Shift Left / Up" },
 	{ action: "Next workspace", keys: "Alt Shift Right / Down" },
 	{ action: "Open settings", keys: "Ctrl ," },
+	{ action: "Command palette", keys: "Ctrl K" },
 ];
 
 const GIT_POLL_INTERVAL_MS = 30_000;
 const FILE_TREE_MIN_WIDTH = 180;
 const FILE_TREE_MAX_WIDTH = 520;
 const FILE_TREE_DEFAULT_WIDTH = 270;
+
+function fuzzyScore(value: string, query: string) {
+	const source = value.toLowerCase();
+	const needle = query.trim().toLowerCase();
+	if (!needle) return 1;
+
+	let score = 0;
+	let sourceIndex = 0;
+	let previousMatchIndex = -1;
+
+	for (let needleIndex = 0; needleIndex < needle.length; needleIndex += 1) {
+		const char = needle[needleIndex];
+		const matchIndex = source.indexOf(char, sourceIndex);
+		if (matchIndex < 0) return -1;
+		const isConsecutive = previousMatchIndex >= 0 && matchIndex === previousMatchIndex + 1;
+		score += isConsecutive ? 4 : 2;
+		score -= Math.max(0, matchIndex - sourceIndex) * 0.12;
+		sourceIndex = matchIndex + 1;
+		previousMatchIndex = matchIndex;
+	}
+
+	return score;
+}
+
+function CommandPalette({ open, actions, onClose }: { open: boolean; actions: CommandAction[]; onClose: () => void }) {
+	const inputRef = useRef<HTMLInputElement | null>(null);
+	const [query, setQuery] = useState("");
+	const [selectedIndex, setSelectedIndex] = useState(0);
+
+	useEffect(() => {
+		if (!open) return;
+		setQuery("");
+		setSelectedIndex(0);
+		const rafId = window.requestAnimationFrame(() => inputRef.current?.focus());
+		return () => window.cancelAnimationFrame(rafId);
+	}, [open]);
+
+	const filteredActions = useMemo(() => {
+		const normalizedQuery = query.trim();
+		if (!normalizedQuery) return actions;
+		return actions
+			.map((action) => ({
+				action,
+				score: Math.max(
+					fuzzyScore(`${action.label} ${action.category} ${action.shortcut ?? ""}`, normalizedQuery),
+					fuzzyScore(action.keywords ?? "", normalizedQuery),
+				),
+			}))
+			.filter((entry) => entry.score >= 0)
+			.sort((left, right) => right.score - left.score)
+			.map((entry) => entry.action);
+	}, [actions, query]);
+
+	useEffect(() => {
+		setSelectedIndex((current) => {
+			if (filteredActions.length === 0) return 0;
+			return Math.max(0, Math.min(current, filteredActions.length - 1));
+		});
+	}, [filteredActions]);
+
+	const executeAction = useCallback(
+		(action: CommandAction | undefined) => {
+			if (!action || action.disabled) return;
+			action.run();
+			onClose();
+		},
+		[onClose],
+	);
+
+	if (typeof document === "undefined") return null;
+
+	return createPortal(
+		<AnimatePresence>
+			{open ? (
+				<>
+					<button type="button" className="command-palette-scrim" onMouseDown={onClose} aria-label="Close command palette" />
+					<motion.div
+						className="command-palette"
+						initial={{ opacity: 0, y: 8 }}
+						animate={{ opacity: 1, y: 0 }}
+						exit={{ opacity: 0, y: 8 }}
+						transition={{ duration: 0.16, ease: [0.22, 1, 0.36, 1] }}
+						role="dialog"
+						aria-label="Command palette"
+					>
+						<input
+							ref={inputRef}
+							type="text"
+							className="command-palette-input"
+							value={query}
+							onChange={(event) => setQuery(event.target.value)}
+							onKeyDown={(event) => {
+								if (event.key === "ArrowDown") {
+									event.preventDefault();
+									setSelectedIndex((current) => (filteredActions.length === 0 ? 0 : (current + 1) % filteredActions.length));
+									return;
+								}
+								if (event.key === "ArrowUp") {
+									event.preventDefault();
+									setSelectedIndex((current) => (filteredActions.length === 0 ? 0 : (current - 1 + filteredActions.length) % filteredActions.length));
+									return;
+								}
+								if (event.key === "Enter") {
+									event.preventDefault();
+									executeAction(filteredActions[selectedIndex]);
+									return;
+								}
+								if (event.key === "Escape") {
+									event.preventDefault();
+									onClose();
+								}
+							}}
+							placeholder="Type a command"
+							spellCheck={false}
+						/>
+						<div className="command-palette-list" role="listbox" aria-label="Commands">
+							{filteredActions.length === 0 ? <div className="command-palette-empty">No matching commands</div> : null}
+							{filteredActions.map((action, index) => (
+								<button
+									key={action.id}
+									type="button"
+									className={`command-palette-item ${index === selectedIndex ? "active" : ""}`}
+									onMouseEnter={() => setSelectedIndex(index)}
+									onClick={() => executeAction(action)}
+									disabled={action.disabled}
+									role="option"
+									aria-selected={index === selectedIndex}
+								>
+									<div className="command-palette-item-main">
+										<span className="command-palette-item-label">{action.label}</span>
+										<span className="command-palette-item-category">{action.category}</span>
+									</div>
+									{action.shortcut ? <kbd className="command-palette-item-shortcut">{action.shortcut}</kbd> : null}
+								</button>
+							))}
+						</div>
+					</motion.div>
+				</>
+			) : null}
+		</AnimatePresence>,
+		document.body,
+	);
+}
 
 function clampNumber(value: number, min: number, max: number) {
 	return Math.min(max, Math.max(min, value));
@@ -87,7 +256,7 @@ function normalizeWorkspacePath(value: string) {
 function countBusyTabs(node: LayoutNode): number {
 	if (node.type === "pane") {
 		return node.pane.tabs.reduce((count, tab) => {
-			if (tab.kind === "editor" && tab.dirty) return count + 1;
+			if ((tab.kind === "editor" || tab.kind === "markdown") && tab.dirty) return count + 1;
 			if (isTerminalTab(tab) && tab.status === "busy") return count + 1;
 			return count;
 		}, 0);
@@ -110,25 +279,6 @@ function isGitStatusEqual(left: WorkspaceModel["git"], right: WorkspaceModel["gi
 		left.changeCount === right.changeCount &&
 		left.rootPath === right.rootPath
 	);
-}
-
-function findFirstNonFileTreePaneId(node: LayoutNode): string | null {
-	if (node.type === "pane") {
-		const activeTab = node.pane.tabs.find((tab) => tab.id === node.pane.activeTabId) ?? node.pane.tabs[0];
-		return activeTab?.kind !== "fileTree" ? node.pane.id : null;
-	}
-
-	return findFirstNonFileTreePaneId(node.first) ?? findFirstNonFileTreePaneId(node.second);
-}
-
-function resolveFileOpenTargetPaneId(layout: LayoutNode, focusedPaneId?: string) {
-	if (focusedPaneId) {
-		const focusedPane = findPaneById(layout, focusedPaneId);
-		const activeTab = focusedPane?.tabs.find((tab) => tab.id === focusedPane.activeTabId) ?? focusedPane?.tabs[0];
-		if (focusedPane && activeTab?.kind !== "fileTree") return focusedPane.id;
-	}
-
-	return findFirstNonFileTreePaneId(layout) ?? findFirstPaneId(layout);
 }
 
 function detachFileTreeTabs(layout: LayoutNode, workspacePath: string): LayoutNode {
@@ -158,9 +308,7 @@ function detachFileTreeTabs(layout: LayoutNode, workspacePath: string): LayoutNo
 }
 
 function getCanvasSurface(theme: MosaicTheme) {
-	return theme.kind === "light"
-		? `color-mix(in srgb, ${theme.bgWell} 86%, ${theme.bgSurface})`
-		: `color-mix(in srgb, ${theme.bgSurface} 72%, #8b8b96 8%)`;
+	return theme.bgSurface;
 }
 
 function getCanvasBorder(theme: MosaicTheme) {
@@ -210,6 +358,7 @@ function SkinSwatch({ theme }: { theme: MosaicTheme }) {
 	);
 }
 
+
 function FileTreeToggleIcon() {
 	return (
 		<svg className="file-tree-toggle-icon" viewBox="0 0 16 16" fill="none" aria-hidden="true">
@@ -217,6 +366,42 @@ function FileTreeToggleIcon() {
 			<path d="M5.2 6.5h6.1" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" />
 			<path d="M5.2 8.8h4.6" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" />
 		</svg>
+	);
+}
+
+function FloatingFileTreePane({
+	rootPath,
+	onOpenFile,
+	onClose,
+	style,
+}: {
+	rootPath: string;
+	onOpenFile: (filePath: string) => void;
+	onClose: () => void;
+	style: CSSProperties;
+}) {
+	return (
+		<section className="terminal-pane file-tree-floating-pane" style={style}>
+			<div className="terminal-pane-accent" />
+			<div className="pane-header pane-header-tabs file-tree-floating-header">
+				<div className="pane-tab-strip">
+					<button type="button" className="pane-tab-button active file-tree-floating-tab" aria-label="Files">
+						<span className="status-dot pane-tab-status status-idle" />
+						<span className="pane-tab-title">Files</span>
+					</button>
+				</div>
+				<div className="pane-actions">
+					<div className="pane-action-slot" data-tooltip="Close file tree">
+						<button type="button" className="pane-close-button" onClick={onClose} aria-label="Close file tree">
+							×
+						</button>
+					</div>
+				</div>
+			</div>
+			<div className="pane-body">
+				<FileTreeSidebar rootPath={rootPath} onOpenFile={onOpenFile} />
+			</div>
+		</section>
 	);
 }
 
@@ -484,8 +669,9 @@ export function App() {
 	const fileTreePanelRef = useRef<HTMLDivElement>(null);
 	const workspacePillbarRef = useRef<HTMLDivElement>(null);
 	const [settingsPanelPosition, setSettingsPanelPosition] = useState({ left: 8, top: 44, maxHeight: 520 });
-	const [fileTreePanelPosition, setFileTreePanelPosition] = useState({ left: 8, top: 52, maxHeight: 520, bubbleLeft: 18 });
+	const [fileTreePanelPosition, setFileTreePanelPosition] = useState({ left: 8, top: 52, maxHeight: 520 });
 	const [overviewOpen, setOverviewOpen] = useState(false);
+	const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
 	const [renamingWorkspaceId, setRenamingWorkspaceId] = useState<string | null>(null);
 	const [workspaceRenameDraft, setWorkspaceRenameDraft] = useState("");
 	const workspacesRef = useRef<WorkspaceModel[]>([]);
@@ -825,6 +1011,14 @@ export function App() {
 		setSettingsView("root");
 	}, []);
 
+	const openCommandPalette = useCallback(() => {
+		setCommandPaletteOpen(true);
+	}, []);
+
+	const closeCommandPalette = useCallback(() => {
+		setCommandPaletteOpen(false);
+	}, []);
+
 	const closeFileTree = useCallback(() => {
 		setFileTreeOpen(false);
 	}, []);
@@ -866,30 +1060,29 @@ export function App() {
 		if (typeof window === "undefined") return;
 
 		const margin = 8;
+		const gap = 8;
 		const anchorButton = tabOrientation === "horizontal" ? topFileTreeButtonRef.current : railFileTreeButtonRef.current;
 		const buttonRect = anchorButton?.getBoundingClientRect();
 		const panelRect = fileTreePanelRef.current?.getBoundingClientRect();
-		const panelWidth = panelRect?.width ?? 320;
+		const panelWidth = panelRect?.width ?? 270;
 		const panelHeight = panelRect?.height ?? 520;
 
-		let left = buttonRect ? buttonRect.left - 4 : margin;
+		let left = buttonRect ? buttonRect.left : margin;
 		left = Math.min(Math.max(left, margin), Math.max(margin, window.innerWidth - panelWidth - margin));
 
-		let top = buttonRect ? buttonRect.bottom - 10 : 48;
+		let top = buttonRect ? buttonRect.bottom + gap : 52;
 		top = Math.min(Math.max(top, margin), Math.max(margin, window.innerHeight - panelHeight - margin));
 		const maxHeight = Math.max(320, window.innerHeight - top - margin);
-		const bubbleLeft = buttonRect ? clampNumber(buttonRect.left + buttonRect.width / 2 - left - 16, 16, panelWidth - 40) : 18;
 
 		setFileTreePanelPosition((current) => {
 			if (
 				Math.abs(current.left - left) < 0.5 &&
 				Math.abs(current.top - top) < 0.5 &&
-				Math.abs(current.maxHeight - maxHeight) < 0.5 &&
-				Math.abs(current.bubbleLeft - bubbleLeft) < 0.5
+				Math.abs(current.maxHeight - maxHeight) < 0.5
 			) {
 				return current;
 			}
-			return { left, top, maxHeight, bubbleLeft };
+			return { left, top, maxHeight };
 		});
 	}, [tabOrientation]);
 
@@ -969,6 +1162,18 @@ export function App() {
 		}));
 	}, [activeWorkspace, updateWorkspace]);
 
+	const addBrowserPaneToActiveWorkspace = useCallback(() => {
+		if (!activeWorkspace) return;
+		const nextLayout = appendPaneToRight(activeWorkspace.layout, activeWorkspace.path);
+		const insertedPaneId = findLastPaneId(nextLayout);
+		const browserTab = createBrowserTab("about:blank");
+		const layoutWithBrowser = replacePaneTabs(nextLayout, insertedPaneId, [browserTab], browserTab.id);
+		updateWorkspace(activeWorkspace.id, (workspace) => ({
+			...workspace,
+			layout: layoutWithBrowser,
+			focusedPaneId: insertedPaneId,
+		}));
+	}, [activeWorkspace, updateWorkspace]);
 
 	const openFileFromTree = useCallback(
 		async (workspaceId: string, filePath: string) => {
@@ -987,13 +1192,23 @@ export function App() {
 				return;
 			}
 
-			let content: string;
-			try {
-				content = await window.mosaic.readFile(normalizedPath);
-			} catch (error) {
-				const message = error instanceof Error ? error.message : "Failed to read file.";
-				window.alert(message);
-				return;
+			let tab = null as PaneTabModel | null;
+			if (isImagePath(normalizedPath)) {
+				tab = createImageTab(normalizedPath);
+			} else if (isPdfPath(normalizedPath)) {
+				tab = createPdfTab(normalizedPath);
+			} else {
+				let content: string;
+				try {
+					content = await window.mosaic.readFile(normalizedPath);
+				} catch (error) {
+					const message = error instanceof Error ? error.message : "Failed to read file.";
+					window.alert(message);
+					return;
+				}
+				tab = isMarkdownPath(normalizedPath)
+					? createMarkdownTab(normalizedPath, content)
+					: createEditorTab(normalizedPath, content);
 			}
 
 			updateWorkspace(workspaceId, (currentWorkspace) => {
@@ -1006,13 +1221,12 @@ export function App() {
 					};
 				}
 
-				const targetPaneId = resolveFileOpenTargetPaneId(currentWorkspace.layout, currentWorkspace.focusedPaneId);
-				const tab = isMarkdownPath(normalizedPath)
-					? createMarkdownTab(normalizedPath, content)
-					: createEditorTab(normalizedPath, content);
+				const nextLayout = appendPaneToRight(currentWorkspace.layout, currentWorkspace.path);
+				const targetPaneId = findLastPaneId(nextLayout);
+				const layoutWithFile = replacePaneTabs(nextLayout, targetPaneId, [tab], tab.id);
 				return {
 					...currentWorkspace,
-					layout: addTabModelToPane(currentWorkspace.layout, targetPaneId, tab),
+					layout: layoutWithFile,
 					focusedPaneId: targetPaneId,
 				};
 			});
@@ -1047,7 +1261,7 @@ export function App() {
 		if (!activeWorkspace || !focusedPaneId || !focusedPane) return;
 		const activeTab = focusedPane.tabs.find((tab) => tab.id === focusedPane.activeTabId) ?? focusedPane.tabs[0];
 		if (!activeTab) return;
-		if (activeTab.kind === "editor" && activeTab.dirty) {
+		if ((activeTab.kind === "editor" || activeTab.kind === "markdown") && activeTab.dirty) {
 			const shouldClose = window.confirm(`Discard unsaved changes in ${activeTab.title}?`);
 			if (!shouldClose) return;
 		}
@@ -1111,11 +1325,142 @@ export function App() {
 		[activeWorkspace, focusedPaneId, updateWorkspace],
 	);
 
+	const moveFocusedColumn = useCallback(
+		(delta: -1 | 1) => {
+			if (!activeWorkspace || !focusedPaneId) return;
+			const nextLayout = moveColumnContainingPane(activeWorkspace.layout, focusedPaneId, delta);
+			updateWorkspace(activeWorkspace.id, (workspace) => ({
+				...workspace,
+				layout: nextLayout,
+				focusedPaneId,
+			}));
+		},
+		[activeWorkspace, focusedPaneId, updateWorkspace],
+	);
+
+	const commandActions = useMemo<CommandAction[]>(() => {
+		const workspaceActions = workspaces.map((workspace, index) => ({
+			id: `workspace:${workspace.id}`,
+			label: `Switch to ${getWorkspaceTabLabel(workspace)}`,
+			category: "Workspace",
+			keywords: `${workspace.path} ${workspace.git.branch ?? ""}`,
+			run: () => goTo(index),
+		}));
+
+		const skinActions = themeIds.map((id) => ({
+			id: `theme:${id}`,
+			label: `Use ${themes[id].name}`,
+			category: "Settings",
+			keywords: `theme skin ${themes[id].name}`,
+			run: () => setThemeId(id as ThemeId),
+		}));
+
+		const canRunPaneAction = Boolean(activeWorkspace && focusedPaneId);
+
+		return [
+			...workspaceActions,
+			...skinActions,
+			{
+				id: "pane:new-terminal",
+				label: "New terminal pane",
+				category: "Pane",
+				shortcut: "Ctrl Shift Enter",
+				run: addPaneToActiveWorkspace,
+				disabled: !activeWorkspace,
+			},
+			{
+				id: "pane:new-browser",
+				label: "New browser pane",
+				category: "Pane",
+				run: addBrowserPaneToActiveWorkspace,
+				disabled: !activeWorkspace,
+			},
+			{
+				id: "pane:split-vertical",
+				label: "Split focused pane vertically",
+				category: "Pane",
+				shortcut: "Ctrl Shift Alt %",
+				run: () => splitFocusedPane("vertical"),
+				disabled: !canRunPaneAction,
+			},
+			{
+				id: "pane:split-horizontal",
+				label: "Split focused pane horizontally",
+				category: "Pane",
+				shortcut: "Ctrl Shift Alt \"",
+				run: () => splitFocusedPane("horizontal"),
+				disabled: !canRunPaneAction,
+			},
+			{
+				id: "pane:close-focused",
+				label: "Close focused pane tab",
+				category: "Pane",
+				shortcut: "Ctrl Shift W",
+				run: closeFocusedTab,
+				disabled: !canRunPaneAction,
+			},
+			{
+				id: "pane:toggle-zoom",
+				label: "Toggle focused pane zoom",
+				category: "Pane",
+				shortcut: "Ctrl Shift M",
+				run: () => {
+					window.dispatchEvent(new KeyboardEvent("keydown", { key: "m", code: "KeyM", ctrlKey: true, shiftKey: true, bubbles: true }));
+				},
+				disabled: !canRunPaneAction,
+			},
+			{
+				id: "workspace:file-tree",
+				label: "Open file tree",
+				category: "Workspace",
+				run: () => setFileTreeOpen(true),
+				disabled: !activeWorkspace,
+			},
+			{
+				id: "settings:tab-orientation",
+				label: `Use ${tabOrientation === "horizontal" ? "vertical" : "top"} workspace tabs`,
+				category: "Settings",
+				run: () => setTabOrientation((current) => (current === "horizontal" ? "vertical" : "horizontal")),
+			},
+			{
+				id: "settings:open",
+				label: "Open settings",
+				category: "Settings",
+				shortcut: "Ctrl ,",
+				run: () => openSettings(),
+			},
+		];
+	}, [
+		activeWorkspace,
+		addBrowserPaneToActiveWorkspace,
+		addPaneToActiveWorkspace,
+		closeFocusedTab,
+		focusedPaneId,
+		goTo,
+		openSettings,
+		splitFocusedPane,
+		tabOrientation,
+		workspaces,
+	]);
+
 	useEffect(() => {
 		const handleKeydown = (event: KeyboardEvent) => {
+			if ((event.ctrlKey || event.metaKey) && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "k") {
+				event.preventDefault();
+				if (commandPaletteOpen) closeCommandPalette();
+				else openCommandPalette();
+				return;
+			}
+
 			if (event.key === "Escape" && renamingWorkspaceId) {
 				event.preventDefault();
 				cancelWorkspaceRename();
+				return;
+			}
+
+			if (event.key === "Escape" && commandPaletteOpen) {
+				event.preventDefault();
+				closeCommandPalette();
 				return;
 			}
 
@@ -1130,6 +1475,8 @@ export function App() {
 				closeFileTree();
 				return;
 			}
+
+			if (commandPaletteOpen) return;
 
 			const target = event.target as HTMLElement | null;
 			const isEditableTarget =
@@ -1192,10 +1539,16 @@ export function App() {
 				return;
 			}
 
-			if (event.ctrlKey && event.shiftKey && !event.altKey && (event.key === "ArrowLeft" || event.key === "ArrowRight" || event.key === "ArrowUp" || event.key === "ArrowDown")) {
+			if (event.ctrlKey && !event.altKey && !event.shiftKey && (event.key === "ArrowLeft" || event.key === "ArrowRight" || event.key === "ArrowUp" || event.key === "ArrowDown")) {
 				event.preventDefault();
 				const dir = event.key.replace("Arrow", "").toLowerCase() as FocusDirection;
 				moveFocus(dir);
+				return;
+			}
+
+			if (!event.ctrlKey && !event.altKey && event.shiftKey && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
+				event.preventDefault();
+				moveFocusedColumn(event.key === "ArrowLeft" ? -1 : 1);
 				return;
 			}
 
@@ -1239,12 +1592,16 @@ export function App() {
 		addTabToFocusedPane,
 		addWorkspace,
 		cancelWorkspaceRename,
+		closeCommandPalette,
 		closeFileTree,
 		closeFocusedTab,
 		closeSettings,
+		commandPaletteOpen,
 		fileTreeOpen,
 		goTo,
 		moveFocus,
+		moveFocusedColumn,
+		openCommandPalette,
 		openSettings,
 		renamingWorkspaceId,
 		resizeFocusedPane,
@@ -1316,19 +1673,13 @@ export function App() {
 					}}
 					aria-label="Close file tree"
 				/>
-				<div
-					ref={fileTreePanelRef}
-					className={`file-tree-popover ${tabOrientation === "vertical" ? "rail" : "topbar"}`}
-					style={{
-						left: `${fileTreePanelPosition.left}px`,
-						top: `${fileTreePanelPosition.top}px`,
-						maxHeight: `${fileTreePanelPosition.maxHeight}px`,
-						["--file-tree-bubble-left" as string]: `${fileTreePanelPosition.bubbleLeft}px`,
-					}}
-					role="dialog"
-					aria-label="File tree"
-				>
-					<FileTreeSidebar rootPath={activeWorkspace.path} onOpenFile={(filePath) => void openFileFromTree(activeWorkspace.id, filePath)} />
+				<div ref={fileTreePanelRef} className="file-tree-popover-anchor" style={{ left: `${fileTreePanelPosition.left}px`, top: `${fileTreePanelPosition.top}px` }}>
+					<FloatingFileTreePane
+						rootPath={activeWorkspace.path}
+						onOpenFile={(filePath) => void openFileFromTree(activeWorkspace.id, filePath)}
+						onClose={closeFileTree}
+						style={{ height: `${Math.min(fileTreePanelPosition.maxHeight, 620)}px` }}
+					/>
 				</div>
 			</>,
 			document.body,
@@ -1435,9 +1786,9 @@ export function App() {
 		: null;
 
 	return (
-		<div className="app-shell" style={appShellStyle}>
+		<div className="app-shell tw-relative tw-flex tw-h-full tw-w-full tw-flex-col" style={appShellStyle}>
 			{tabOrientation === "horizontal" ? (
-				<header className="topbar titlebar-drag">
+				<header className="topbar titlebar-drag tw-select-none">
 					<div className="topbar-component-row">
 						<div className="topbar-side topbar-side-leading">
 							<button
@@ -1483,10 +1834,10 @@ export function App() {
 			) : null}
 
 			{tabOrientation === "vertical" ? <div className="titlebar-strip titlebar-drag" /> : null}
-			<div className="workspace-main">
-				<div className={`workspace-shell ${tabOrientation === "vertical" ? "with-vertical-tabs" : ""}`}>
+			<div className="workspace-main tw-flex tw-min-h-0 tw-min-w-0 tw-flex-1">
+				<div className={`workspace-shell tw-flex tw-min-h-0 tw-min-w-0 tw-flex-1 ${tabOrientation === "vertical" ? "with-vertical-tabs" : ""}`}>
 					{tabOrientation === "vertical" && workspaces.length > 0 ? (
-						<aside className="workspace-rail" onDragOver={handleWorkspaceDropDragOver} onDrop={handleWorkspaceDrop}>
+						<aside className="workspace-rail tw-flex tw-min-h-0 tw-flex-col" onDragOver={handleWorkspaceDropDragOver} onDrop={handleWorkspaceDrop}>
 							<div className="workspace-rail-header">
 								<button
 									ref={railFileTreeButtonRef}
@@ -1520,10 +1871,10 @@ export function App() {
 								</button>
 								<span className="rail-label">Workspaces</span>
 							</div>
-							<div className="workspace-rail-body">{workspaceTabs}</div>
+							<div className="workspace-rail-body tw-min-h-0 tw-flex-1">{workspaceTabs}</div>
 						</aside>
 					) : null}
-					<div className="workspace-stage">
+					<div className="workspace-stage tw-relative tw-flex-1 tw-overflow-hidden">
 						<AnimatePresence initial={false} mode="wait">
 							{workspaces.length === 0 ? (
 								<motion.div
@@ -1562,6 +1913,7 @@ export function App() {
 										onExitOverview={() => setOverviewOpen(false)}
 										onOpenOverview={() => setOverviewOpen(true)}
 										onAddPane={addPaneToActiveWorkspace}
+										onAddBrowserPane={addBrowserPaneToActiveWorkspace}
 										onOpenFile={(filePath) => void openFileFromTree(activeWorkspace.id, filePath)}
 										onUpdateTab={(paneId, tabId, updater) => updateWorkspaceTab(activeWorkspace.id, paneId, tabId, updater)}
 										focusedPaneId={activeWorkspace.focusedPaneId}
@@ -1600,6 +1952,7 @@ export function App() {
 
 			{fileTreePanel}
 			{settingsPanel}
+			<CommandPalette open={commandPaletteOpen} actions={commandActions} onClose={closeCommandPalette} />
 		</div>
 	);
 }
