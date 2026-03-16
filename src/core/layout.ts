@@ -1,13 +1,22 @@
-import type { LayoutNode, PaneLayoutNode, PaneModel, PaneStatus, SplitDirection, SplitLayoutNode, TerminalTabModel } from "./models";
-import { getWorkspaceLeafName } from "./workspaces";
+import type { LayoutNode, PaneLayoutNode, PaneModel, PaneStatus, PaneTabModel, SplitDirection, SplitLayoutNode, TerminalTabModel } from "./models";
+import {
+	createEditorTab,
+	createFileTreeTab,
+	createMarkdownTab,
+	createTerminalTab,
+	getMonacoLanguage,
+	isTerminalTab,
+	normalizeFilePath,
+} from "./pane-tabs";
 
 export type FocusDirection = "left" | "right" | "up" | "down";
 export type PaneDropPosition = "center" | "left" | "right" | "top" | "bottom";
 
 type PathEntry = { node: SplitLayoutNode; branch: "first" | "second" };
 
-const DEFAULT_WIDTH_UNITS = 1;
-const APPENDED_PANE_WIDTH_UNITS = 0.5;
+export const WIDTH_UNIT_BASE = 100;
+const DEFAULT_WIDTH_UNITS = WIDTH_UNIT_BASE;
+const APPENDED_PANE_WIDTH_UNITS = WIDTH_UNIT_BASE / 2;
 export const COLUMN_INSERT_WIDTH_UNITS = APPENDED_PANE_WIDTH_UNITS;
 
 function clampWidthUnits(value: number) {
@@ -66,21 +75,20 @@ function findPath(root: LayoutNode, paneId: string): PathEntry[] | null {
 	return null;
 }
 
-function createTerminalTab(workspacePath: string): TerminalTabModel {
-	return {
-		id: crypto.randomUUID(),
-		title: getWorkspaceLeafName(workspacePath),
-		status: "starting",
-		message: "Launching terminal...",
-	};
-}
-
 export function createPaneModel(workspacePath: string): PaneModel {
 	const firstTab = createTerminalTab(workspacePath);
 	return {
 		id: crypto.randomUUID(),
 		tabs: [firstTab],
 		activeTabId: firstTab.id,
+	};
+}
+
+export function createPaneModelFromTab(tab: PaneTabModel): PaneModel {
+	return {
+		id: crypto.randomUUID(),
+		tabs: [tab],
+		activeTabId: tab.id,
 	};
 }
 
@@ -115,6 +123,35 @@ export function findLastPaneId(node: LayoutNode): string {
 export function findPaneById(node: LayoutNode, paneId: string): PaneModel | null {
 	if (node.type === "pane") return node.pane.id === paneId ? node.pane : null;
 	return findPaneById(node.first, paneId) ?? findPaneById(node.second, paneId);
+}
+
+export function findTabById(node: LayoutNode, tabId: string): { paneId: string; tab: PaneTabModel } | null {
+	if (node.type === "pane") {
+		const tab = node.pane.tabs.find((item) => item.id === tabId);
+		return tab ? { paneId: node.pane.id, tab } : null;
+	}
+
+	return findTabById(node.first, tabId) ?? findTabById(node.second, tabId);
+}
+
+export function findTabByFilePath(node: LayoutNode, filePath: string): { paneId: string; tabId: string } | null {
+	const normalizedPath = normalizeFilePath(filePath);
+	if (node.type === "pane") {
+		const tab = node.pane.tabs.find((item) =>
+			(item.kind === "editor" || item.kind === "markdown") && normalizeFilePath(item.filePath) === normalizedPath,
+		);
+		return tab ? { paneId: node.pane.id, tabId: tab.id } : null;
+	}
+
+	return findTabByFilePath(node.first, normalizedPath) ?? findTabByFilePath(node.second, normalizedPath);
+}
+
+export function findPaneIdWithTabKind(node: LayoutNode, kind: PaneTabModel["kind"]): string | null {
+	if (node.type === "pane") {
+		return node.pane.tabs.some((tab) => tab.kind === kind) ? node.pane.id : null;
+	}
+
+	return findPaneIdWithTabKind(node.first, kind) ?? findPaneIdWithTabKind(node.second, kind);
 }
 
 export function getAllTabIds(node: LayoutNode): string[] {
@@ -163,12 +200,14 @@ function removePaneInternal(node: LayoutNode, paneId: string, isRoot: boolean): 
 
 	if (!first && !second) return null;
 	if (!first) {
-		const nextWidthUnits = isRoot ? Math.max(DEFAULT_WIDTH_UNITS, getNodeWidthUnits(second)) : getNodeWidthUnits(node);
-		return resizeLayoutWidth(second, nextWidthUnits);
+		const survivingSecond = second as LayoutNode;
+		const nextWidthUnits = isRoot ? Math.max(DEFAULT_WIDTH_UNITS, getNodeWidthUnits(survivingSecond)) : getNodeWidthUnits(node);
+		return resizeLayoutWidth(survivingSecond, nextWidthUnits);
 	}
 	if (!second) {
-		const nextWidthUnits = isRoot ? Math.max(DEFAULT_WIDTH_UNITS, getNodeWidthUnits(first)) : getNodeWidthUnits(node);
-		return resizeLayoutWidth(first, nextWidthUnits);
+		const survivingFirst = first as LayoutNode;
+		const nextWidthUnits = isRoot ? Math.max(DEFAULT_WIDTH_UNITS, getNodeWidthUnits(survivingFirst)) : getNodeWidthUnits(node);
+		return resizeLayoutWidth(survivingFirst, nextWidthUnits);
 	}
 
 	return {
@@ -215,6 +254,14 @@ export function addTabToPane(node: LayoutNode, paneId: string, workspacePath: st
 	});
 }
 
+export function addTabModelToPane(node: LayoutNode, paneId: string, tab: PaneTabModel): LayoutNode {
+	return mapPane(node, paneId, (pane) => ({
+		...pane,
+		tabs: [...pane.tabs, tab],
+		activeTabId: tab.id,
+	}));
+}
+
 export function appendPaneToRight(node: LayoutNode, workspacePath: string): LayoutNode {
 	const existingWidthUnits = getNodeWidthUnits(node);
 	const nextWidthUnits = existingWidthUnits + APPENDED_PANE_WIDTH_UNITS;
@@ -227,6 +274,22 @@ export function appendPaneToRight(node: LayoutNode, workspacePath: string): Layo
 		widthUnits: nextWidthUnits,
 		first: resizeLayoutWidth(node, existingWidthUnits),
 		second: createPaneNode(workspacePath, createPaneModel(workspacePath), APPENDED_PANE_WIDTH_UNITS),
+	};
+}
+
+export function prependPaneToLeft(node: LayoutNode, pane: PaneModel): LayoutNode {
+	const existingWidthUnits = getNodeWidthUnits(node);
+	const insertedWidthUnits = APPENDED_PANE_WIDTH_UNITS;
+	const nextWidthUnits = existingWidthUnits + insertedWidthUnits;
+
+	return {
+		type: "split",
+		id: crypto.randomUUID(),
+		direction: "vertical",
+		ratio: insertedWidthUnits / nextWidthUnits,
+		widthUnits: nextWidthUnits,
+		first: createPaneNodeFromModel(pane, insertedWidthUnits),
+		second: resizeLayoutWidth(node, existingWidthUnits),
 	};
 }
 
@@ -504,6 +567,9 @@ export function movePaneToColumnIndex(node: LayoutNode, sourcePaneId: string, co
 	const columns: LayoutNode[] = [];
 	collectRootColumns(layoutWithoutSource, columns);
 	const clampedIndex = Math.max(0, Math.min(columnIndex, columns.length));
+	if (clampedIndex === 0) return movePaneToOuterColumn(node, sourcePaneId, "left");
+	if (clampedIndex === columns.length) return movePaneToOuterColumn(node, sourcePaneId, "right");
+
 	const nextColumns = [...columns];
 	nextColumns.splice(clampedIndex, 0, createPaneNodeFromModel(sourcePane, APPENDED_PANE_WIDTH_UNITS));
 	return buildRootColumns(nextColumns);
@@ -585,26 +651,50 @@ export function moveTabToPane(
 	});
 }
 
+export function updatePaneTab(
+	node: LayoutNode,
+	paneId: string,
+	tabId: string,
+	updater: (tab: PaneTabModel) => PaneTabModel,
+): LayoutNode {
+	return mapPane(node, paneId, (pane) => ({
+		...pane,
+		tabs: pane.tabs.map((tab) => (tab.id === tabId ? updater(tab) : tab)),
+	}));
+}
+
 export function updateTabMeta(
 	node: LayoutNode,
 	paneId: string,
 	tabId: string,
 	patch: Partial<Pick<TerminalTabModel, "status" | "shellLabel" | "message" | "title">>,
 ): LayoutNode {
-	return mapPane(node, paneId, (pane) => ({
-		...pane,
-		tabs: pane.tabs.map((tab) => (tab.id === tabId ? { ...tab, ...patch } : tab)),
-	}));
+	return updatePaneTab(node, paneId, tabId, (tab) => (isTerminalTab(tab) ? { ...tab, ...patch } : tab));
 }
 
 export function updateSplitRatio(node: LayoutNode, splitId: string, ratio: number): LayoutNode {
 	if (node.type === "pane") return node;
 	if (node.id === splitId) {
-		const nextRatio = clampRatio(ratio);
 		const widthUnits = getNodeWidthUnits(node);
-		const firstWidthUnits = node.direction === "vertical" ? widthUnits * nextRatio : widthUnits;
-		const secondWidthUnits = node.direction === "vertical" ? widthUnits * (1 - nextRatio) : widthUnits;
 
+		if (node.direction === "vertical") {
+			const requestedRatio = Number.isFinite(ratio) ? ratio : node.ratio;
+			const currentSecondWidthUnits = getBranchWidthUnits(node, "second");
+			const nextFirstWidthUnits = clampWidthUnits(widthUnits * requestedRatio);
+			const nextWidthUnits = nextFirstWidthUnits + currentSecondWidthUnits;
+			const normalizedRatio = clampRatio(nextFirstWidthUnits / nextWidthUnits);
+			return {
+				...node,
+				ratio: normalizedRatio,
+				widthUnits: nextWidthUnits,
+				first: resizeLayoutWidth(node.first, nextFirstWidthUnits),
+				second: resizeLayoutWidth(node.second, currentSecondWidthUnits),
+			};
+		}
+
+		const nextRatio = clampRatio(ratio);
+		const firstWidthUnits = widthUnits;
+		const secondWidthUnits = widthUnits;
 		return {
 			...node,
 			ratio: nextRatio,
@@ -614,11 +704,28 @@ export function updateSplitRatio(node: LayoutNode, splitId: string, ratio: numbe
 		};
 	}
 
+	const nextFirst = updateSplitRatio(node.first, splitId, ratio);
+	const nextSecond = updateSplitRatio(node.second, splitId, ratio);
+
+	if (node.direction === "vertical") {
+		const nextFirstWidthUnits = getNodeWidthUnits(nextFirst);
+		const nextSecondWidthUnits = getNodeWidthUnits(nextSecond);
+		const nextWidthUnits = nextFirstWidthUnits + nextSecondWidthUnits;
+		return {
+			...node,
+			ratio: clampRatio(nextFirstWidthUnits / nextWidthUnits),
+			widthUnits: nextWidthUnits,
+			first: resizeLayoutWidth(nextFirst, nextFirstWidthUnits),
+			second: resizeLayoutWidth(nextSecond, nextSecondWidthUnits),
+		};
+	}
+
+	const nextWidthUnits = Math.max(getNodeWidthUnits(nextFirst), getNodeWidthUnits(nextSecond));
 	return {
 		...node,
-		widthUnits: getNodeWidthUnits(node),
-		first: updateSplitRatio(node.first, splitId, ratio),
-		second: updateSplitRatio(node.second, splitId, ratio),
+		widthUnits: nextWidthUnits,
+		first: resizeLayoutWidth(nextFirst, nextWidthUnits),
+		second: resizeLayoutWidth(nextSecond, nextWidthUnits),
 	};
 }
 
@@ -773,13 +880,45 @@ function resizeVerticalSplitKeepSecondWidth(node: SplitLayoutNode, deltaRatio: n
 	};
 }
 
-export function resizeVerticalSplitByDelta(root: LayoutNode, splitId: string, deltaRatio: number): LayoutNode {
+function resizeVerticalSplitKeepFirstWidth(node: SplitLayoutNode, deltaRatio: number): LayoutNode | null {
+	if (node.direction !== "vertical") return null;
+	const splitWidth = getNodeWidthUnits(node);
+	const deltaUnits = splitWidth * deltaRatio;
+	if (Math.abs(deltaUnits) < 1e-5) return null;
+
+	const firstWidth = getBranchWidthUnits(node, "first");
+	const secondWidth = getBranchWidthUnits(node, "second");
+	const minBranchWidth = Math.max(0.08, splitWidth * 0.08);
+	const nextSecondWidth = Math.max(minBranchWidth, secondWidth + deltaUnits);
+	if (Math.abs(nextSecondWidth - secondWidth) < 1e-6) return null;
+
+	const nextWidthUnits = firstWidth + nextSecondWidth;
+	const nextRatio = firstWidth / nextWidthUnits;
+	const safeRatio = Math.min(0.999, Math.max(0.001, nextRatio));
+
+	return {
+		...node,
+		ratio: safeRatio,
+		widthUnits: nextWidthUnits,
+		first: resizeLayoutWidth(node.first, firstWidth),
+		second: resizeLayoutWidth(node.second, nextSecondWidth),
+	};
+}
+
+export function resizeVerticalSplitByDelta(
+	root: LayoutNode,
+	splitId: string,
+	deltaRatio: number,
+	branch: "first" | "second" = "first",
+): LayoutNode {
 	const path = findSplitPath(root, splitId);
 	if (path === null) return root;
 	const target = findSplitById(root, splitId);
 	if (!target) return root;
 
-	const resizedTarget = resizeVerticalSplitKeepSecondWidth(target, deltaRatio);
+	const resizedTarget = branch === "first"
+		? resizeVerticalSplitKeepSecondWidth(target, deltaRatio)
+		: resizeVerticalSplitKeepFirstWidth(target, deltaRatio);
 	if (!resizedTarget) return root;
 
 	return rebuildPathAfterResize(path, path.length, resizedTarget);
@@ -818,6 +957,61 @@ export function resizeFromPane(root: LayoutNode, paneId: string, direction: Focu
 	return root;
 }
 
+function rehydrateTab(rawTab: unknown, workspacePath: string): PaneTabModel {
+	if (!rawTab || typeof rawTab !== "object") return createTerminalTab(workspacePath);
+	const tab = rawTab as Partial<PaneTabModel> & { kind?: string };
+
+	if (!tab.kind || tab.kind === "terminal") {
+		const title = typeof tab.title === "string" && tab.title.trim().length > 0 ? tab.title : "terminal";
+		return {
+			id: typeof tab.id === "string" ? tab.id : crypto.randomUUID(),
+			kind: "terminal",
+			title,
+			status: "starting" as PaneStatus,
+			shellLabel: undefined,
+			message: "Launching terminal...",
+		};
+	}
+
+	if (tab.kind === "fileTree") {
+		return {
+			...(createFileTreeTab(workspacePath)),
+			id: typeof tab.id === "string" ? tab.id : crypto.randomUUID(),
+			title: typeof tab.title === "string" ? tab.title : "Files",
+			rootPath: typeof (tab as { rootPath?: string }).rootPath === "string" ? (tab as { rootPath: string }).rootPath : workspacePath,
+		};
+	}
+
+	if (tab.kind === "editor") {
+		const filePath = typeof (tab as { filePath?: string }).filePath === "string" ? (tab as { filePath: string }).filePath : "";
+		const content = typeof (tab as { content?: string }).content === "string" ? (tab as { content: string }).content : "";
+		const savedContent = typeof (tab as { savedContent?: string }).savedContent === "string"
+			? (tab as { savedContent: string }).savedContent
+			: content;
+		return {
+			...createEditorTab(filePath, content),
+			id: typeof tab.id === "string" ? tab.id : crypto.randomUUID(),
+			title: typeof tab.title === "string" ? tab.title : createEditorTab(filePath, content).title,
+			language: typeof (tab as { language?: string }).language === "string" ? (tab as { language: string }).language : getMonacoLanguage(filePath),
+			savedContent,
+			dirty: typeof (tab as { dirty?: boolean }).dirty === "boolean" ? (tab as { dirty: boolean }).dirty : content !== savedContent,
+			message: typeof (tab as { message?: string }).message === "string" ? (tab as { message: string }).message : undefined,
+		};
+	}
+
+	if (tab.kind === "markdown") {
+		const filePath = typeof (tab as { filePath?: string }).filePath === "string" ? (tab as { filePath: string }).filePath : "";
+		const content = typeof (tab as { content?: string }).content === "string" ? (tab as { content: string }).content : "";
+		return {
+			...createMarkdownTab(filePath, content),
+			id: typeof tab.id === "string" ? tab.id : crypto.randomUUID(),
+			title: typeof tab.title === "string" ? tab.title : createMarkdownTab(filePath, content).title,
+		};
+	}
+
+	return createTerminalTab(workspacePath);
+}
+
 export function rehydrateLayout(
 	node: LayoutNode | undefined,
 	workspacePath: string,
@@ -826,14 +1020,7 @@ export function rehydrateLayout(
 	if (!node) return createPaneNode(workspacePath, createPaneModel(workspacePath), inheritedWidthUnits);
 
 	if (node.type === "pane") {
-		const tabs = node.pane.tabs?.length
-			? node.pane.tabs.map((tab) => ({
-					...tab,
-					status: "starting" as PaneStatus,
-					shellLabel: undefined,
-					message: "Launching terminal...",
-			  }))
-			: [createTerminalTab(workspacePath)];
+		const tabs = node.pane.tabs?.length ? node.pane.tabs.map((tab) => rehydrateTab(tab, workspacePath)) : [createTerminalTab(workspacePath)];
 
 		return {
 			...node,

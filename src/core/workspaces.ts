@@ -36,5 +36,12 @@ export function getWorkspaceTabLabel(workspace: Pick<WorkspaceModel, "path" | "c
 }
 
 export function serializeWorkspaceState(workspaces: WorkspaceModel[]) {
-	return workspaces.map(({ id, path, customName, layout, focusedPaneId }) => ({ id, path, customName, layout, focusedPaneId }));
+	return workspaces.map(({ id, path, customName, accentColor, layout, focusedPaneId }) => ({
+		id,
+		path,
+		customName,
+		accentColor,
+		layout,
+		focusedPaneId,
+	}));
 }

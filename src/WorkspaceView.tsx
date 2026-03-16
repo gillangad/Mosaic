@@ -4,6 +4,7 @@ import {
 	addTabToPane,
 	closeTab,
 	COLUMN_INSERT_WIDTH_UNITS,
+	WIDTH_UNIT_BASE,
 	findFirstPaneId,
 	findPaneById,
 	getLayoutWidthUnits,
@@ -17,7 +18,8 @@ import {
 	updateTabMeta,
 	type PaneDropPosition,
 } from "./core/layout";
-import type { LayoutNode, PaneModel, SplitDirection, TerminalTabModel, WorkspaceModel } from "./core/models";
+import type { LayoutNode, PaneModel, PaneTabModel, SplitDirection, TerminalTabModel, WorkspaceModel } from "./core/models";
+import { isTerminalTab } from "./core/pane-tabs";
 import type { MosaicTheme } from "./core/themes";
 import { useSessionManager } from "./core/terminal-backend-context";
 
@@ -32,19 +34,24 @@ interface LayoutViewProps {
 	zoomedPaneId: string | null;
 	onFocusPane: (paneId: string) => void;
 	onSplit: (paneId: string, direction: SplitDirection) => void;
+	onMovePaneToNewColumn: (paneId: string) => void;
+	canMovePaneToNewColumn: (paneId: string) => boolean;
 	onClosePane: (paneId: string) => void;
 	onAddTab: (paneId: string) => void;
 	onSelectTab: (paneId: string, tabId: string) => void;
 	onCloseTab: (paneId: string, tabId: string) => void;
 	onMoveTab: (sourcePaneId: string, tabId: string, targetPaneId: string) => void;
 	onTogglePaneZoom: (paneId: string) => void;
-	onResize: (splitId: string, ratio: number) => void;
+	onResizeHorizontalSplit: (splitId: string, ratio: number) => void;
+	onResizeVerticalSplitBranch: (splitId: string, branch: "first" | "second", deltaRatio: number) => void;
 	onRegisterPaneElement: (paneId: string, element: HTMLDivElement | null) => void;
 	onUpdateTabMeta: (
 		paneId: string,
 		tabId: string,
 		patch: Partial<Pick<TerminalTabModel, "status" | "shellLabel" | "message" | "title">>,
 	) => void;
+	onOpenFile: (filePath: string, sourcePaneId: string) => void;
+	onUpdateTab: (paneId: string, tabId: string, updater: (tab: PaneTabModel) => PaneTabModel) => void;
 }
 
 function LayoutView({
@@ -56,15 +63,20 @@ function LayoutView({
 	zoomedPaneId,
 	onFocusPane,
 	onSplit,
+	onMovePaneToNewColumn,
+	canMovePaneToNewColumn,
 	onClosePane,
 	onAddTab,
 	onSelectTab,
 	onCloseTab,
 	onMoveTab,
 	onTogglePaneZoom,
-	onResize,
+	onResizeHorizontalSplit,
+	onResizeVerticalSplitBranch,
 	onRegisterPaneElement,
 	onUpdateTabMeta,
+	onOpenFile,
+	onUpdateTab,
 }: LayoutViewProps) {
 	if (node.type === "pane") {
 		return (
@@ -77,6 +89,8 @@ function LayoutView({
 					focused={focusedPaneId === node.pane.id}
 					zoomed={zoomedPaneId === node.pane.id}
 					onFocus={() => onFocusPane(node.pane.id)}
+					onMoveToNewColumn={() => onMovePaneToNewColumn(node.pane.id)}
+					canMoveToNewColumn={canMovePaneToNewColumn(node.pane.id)}
 					onSplitVertical={() => onSplit(node.pane.id, "vertical")}
 					onSplitHorizontal={() => onSplit(node.pane.id, "horizontal")}
 					onClose={() => onClosePane(node.pane.id)}
@@ -86,22 +100,47 @@ function LayoutView({
 					onMoveTab={onMoveTab}
 					onToggleZoom={() => onTogglePaneZoom(node.pane.id)}
 					onUpdateTabMeta={(tabId, patch) => onUpdateTabMeta(node.pane.id, tabId, patch)}
+					onOpenFile={(filePath) => onOpenFile(filePath, node.pane.id)}
+					onUpdateTab={(tabId, updater) => onUpdateTab(node.pane.id, tabId, updater)}
 				/>
 			</div>
 		);
 	}
 
-	const beginResize = (event: ReactMouseEvent<HTMLButtonElement>) => {
+	const beginHorizontalResize = (event: ReactMouseEvent<HTMLButtonElement>) => {
 		const container = event.currentTarget.parentElement;
 		if (!container) return;
 
 		const rect = container.getBoundingClientRect();
 		const handleMove = (moveEvent: MouseEvent) => {
-			const nextRatio =
-				node.direction === "vertical"
-					? (moveEvent.clientX - rect.left) / rect.width
-					: (moveEvent.clientY - rect.top) / rect.height;
-			onResize(node.id, nextRatio);
+			const nextRatio = (moveEvent.clientY - rect.top) / rect.height;
+			onResizeHorizontalSplit(node.id, nextRatio);
+		};
+		const handleUp = () => {
+			window.removeEventListener("mousemove", handleMove);
+			window.removeEventListener("mouseup", handleUp);
+			document.body.classList.remove("is-resizing");
+		};
+
+		document.body.classList.add("is-resizing");
+		window.addEventListener("mousemove", handleMove);
+		window.addEventListener("mouseup", handleUp);
+	};
+
+	const beginVerticalResize = (branch: "first" | "second") => (event: ReactMouseEvent<HTMLButtonElement>) => {
+		const container = event.currentTarget.closest(".layout-split") as HTMLDivElement | null;
+		if (!container) return;
+		event.preventDefault();
+		event.stopPropagation();
+
+		const rect = container.getBoundingClientRect();
+		let lastClientX = event.clientX;
+		const handleMove = (moveEvent: MouseEvent) => {
+			const deltaPx = moveEvent.clientX - lastClientX;
+			lastClientX = moveEvent.clientX;
+			if (Math.abs(deltaPx) < 0.01) return;
+			const deltaRatio = deltaPx / Math.max(rect.width, 1);
+			onResizeVerticalSplitBranch(node.id, branch, branch === "first" ? deltaRatio : -deltaRatio);
 		};
 		const handleUp = () => {
 			window.removeEventListener("mousemove", handleMove);
@@ -129,23 +168,45 @@ function LayoutView({
 					zoomedPaneId={zoomedPaneId}
 					onFocusPane={onFocusPane}
 					onSplit={onSplit}
+					onMovePaneToNewColumn={onMovePaneToNewColumn}
+					canMovePaneToNewColumn={canMovePaneToNewColumn}
 					onClosePane={onClosePane}
 					onAddTab={onAddTab}
 					onSelectTab={onSelectTab}
 					onCloseTab={onCloseTab}
 					onMoveTab={onMoveTab}
 					onTogglePaneZoom={onTogglePaneZoom}
-					onResize={onResize}
+					onResizeHorizontalSplit={onResizeHorizontalSplit}
+					onResizeVerticalSplitBranch={onResizeVerticalSplitBranch}
 					onRegisterPaneElement={onRegisterPaneElement}
 					onUpdateTabMeta={onUpdateTabMeta}
+					onOpenFile={onOpenFile}
+					onUpdateTab={onUpdateTab}
 				/>
 			</div>
-			<button
-				type="button"
-				className={`layout-resizer layout-resizer-${node.direction}`}
-				onMouseDown={beginResize}
-				aria-label={node.direction === "vertical" ? "Resize panes horizontally" : "Resize panes vertically"}
-			/>
+			{node.direction === "vertical" ? (
+				<div className="layout-resizer layout-resizer-vertical" role="separator" aria-label="Resize columns">
+					<button
+						type="button"
+						className="layout-edge-handle first"
+						onMouseDown={beginVerticalResize("first")}
+						aria-label="Resize right edge of left column"
+					/>
+					<button
+						type="button"
+						className="layout-edge-handle second"
+						onMouseDown={beginVerticalResize("second")}
+						aria-label="Resize left edge of right column"
+					/>
+				</div>
+			) : (
+				<button
+					type="button"
+					className="layout-resizer layout-resizer-horizontal"
+					onMouseDown={beginHorizontalResize}
+					aria-label="Resize panes vertically"
+				/>
+			)}
 			<div
 				className={`layout-branch ${node.direction === "vertical" ? "vertical-second" : "horizontal-second"}`}
 				style={{
@@ -162,15 +223,20 @@ function LayoutView({
 					zoomedPaneId={zoomedPaneId}
 					onFocusPane={onFocusPane}
 					onSplit={onSplit}
+					onMovePaneToNewColumn={onMovePaneToNewColumn}
+					canMovePaneToNewColumn={canMovePaneToNewColumn}
 					onClosePane={onClosePane}
 					onAddTab={onAddTab}
 					onSelectTab={onSelectTab}
 					onCloseTab={onCloseTab}
 					onMoveTab={onMoveTab}
 					onTogglePaneZoom={onTogglePaneZoom}
-					onResize={onResize}
+					onResizeHorizontalSplit={onResizeHorizontalSplit}
+					onResizeVerticalSplitBranch={onResizeVerticalSplitBranch}
 					onRegisterPaneElement={onRegisterPaneElement}
 					onUpdateTabMeta={onUpdateTabMeta}
+					onOpenFile={onOpenFile}
+					onUpdateTab={onUpdateTab}
 				/>
 			</div>
 		</div>
@@ -321,7 +387,8 @@ function hitTestPaneRects(
 
 const OVERVIEW_COLUMN_INSERT_THRESHOLD_PX = 20;
 const OVERVIEW_COLUMN_INSERT_HYSTERESIS_PX = 2;
-const OVERVIEW_COLUMN_INSERT_WIDTH_WORLD = COLUMN_INSERT_WIDTH_UNITS * 1100;
+const OVERVIEW_COLUMN_INSERT_WIDTH_WORLD = (COLUMN_INSERT_WIDTH_UNITS / WIDTH_UNIT_BASE) * 1100;
+const OVERVIEW_EDGE_ALLOWANCE_WORLD = OVERVIEW_COLUMN_INSERT_WIDTH_WORLD * 2;
 
 interface UsePaneDragOptions {
 	paneRects: OverviewPaneRect[];
@@ -411,17 +478,18 @@ interface OverviewCanvasProps {
 	onFocusPane: (paneId: string) => void;
 	onMovePane: (sourcePaneId: string, targetPaneId: string, position: PaneDropPosition) => void;
 	onInsertColumn: (sourcePaneId: string, columnIndex: number) => void;
+	onClosePane: (paneId: string) => void;
 	onExitOverview: () => void;
 }
 
-function OverviewCanvas({ layout, focusedPaneId, onFocusPane, onMovePane, onInsertColumn, onExitOverview }: OverviewCanvasProps) {
+function OverviewCanvas({ layout, focusedPaneId, onFocusPane, onMovePane, onInsertColumn, onClosePane, onExitOverview }: OverviewCanvasProps) {
 	const sessionManager = useSessionManager();
 	const stageRef = useRef<HTMLDivElement | null>(null);
 	const [viewport, setViewport] = useState({ width: 1, height: 1 });
 	const [camera, setCamera] = useState({ x: 0, y: 0, scale: 1 });
 	const [panState, setPanState] = useState<null | { startClientX: number; startClientY: number; originX: number; originY: number }>(null);
 
-	const contentWidth = Math.max(getLayoutWidthUnits(layout), 1) * 1100;
+	const contentWidth = (Math.max(getLayoutWidthUnits(layout), WIDTH_UNIT_BASE) / WIDTH_UNIT_BASE) * 1100;
 	const contentHeight = 760;
 
 	const paneRects = useMemo(() => {
@@ -457,7 +525,8 @@ function OverviewCanvas({ layout, focusedPaneId, onFocusPane, onMovePane, onInse
 
 	useEffect(() => {
 		const padding = 56;
-		const fitScale = Math.min((viewport.width - padding) / contentWidth, (viewport.height - padding) / contentHeight);
+		const fitWidth = contentWidth + OVERVIEW_EDGE_ALLOWANCE_WORLD;
+		const fitScale = Math.min((viewport.width - padding) / fitWidth, (viewport.height - padding) / contentHeight);
 		const nextScale = clamp(fitScale, 0.15, 1.15);
 		const nextX = (viewport.width - contentWidth * nextScale) / 2;
 		const nextY = (viewport.height - contentHeight * nextScale) / 2;
@@ -602,6 +671,7 @@ function OverviewCanvas({ layout, focusedPaneId, onFocusPane, onMovePane, onInse
 			height: contentHeight * camera.scale,
 		}
 		: null;
+	const overviewCloseScale = clamp(1 / camera.scale, 1, 2.4);
 
 	return (
 		<div
@@ -693,7 +763,24 @@ function OverviewCanvas({ layout, focusedPaneId, onFocusPane, onMovePane, onInse
 								startDrag(paneRect.pane.id, event.clientX, event.clientY);
 							}}
 						>
-							<div className="overview-pane-header">{activeTab?.title ?? "terminal"}</div>
+							<div className="overview-pane-title-row">
+								<div className="overview-pane-header">{activeTab?.title ?? "terminal"}</div>
+								<button
+									type="button"
+									className="overview-pane-close"
+									style={{ ["--overview-close-scale" as string]: String(overviewCloseScale) }}
+									onMouseDown={(event) => {
+										event.stopPropagation();
+									}}
+									onClick={(event) => {
+										event.stopPropagation();
+										onClosePane(paneRect.pane.id);
+									}}
+									aria-label={`Close pane ${activeTab?.title ?? "terminal"}`}
+								>
+									×
+								</button>
+							</div>
 							<div className="overview-pane-meta">{paneRect.pane.tabs.length} tab{paneRect.pane.tabs.length === 1 ? "" : "s"}</div>
 							<pre className="overview-pane-preview">{preview}</pre>
 							{dropPosition ? <div className={`overview-drop-overlay ${dropPosition}`} /> : null}
@@ -741,6 +828,8 @@ interface WorkspaceViewProps {
 	onExitOverview: () => void;
 	onOpenOverview: () => void;
 	onAddPane: () => void;
+	onOpenFile: (filePath: string) => void;
+	onUpdateTab: (paneId: string, tabId: string, updater: (tab: PaneTabModel) => PaneTabModel) => void;
 	onFocusPane: (paneId: string) => void;
 	onSwapPanes: (sourcePaneId: string, targetPaneId: string) => void;
 	onSplitPane: (paneId: string, direction: SplitDirection) => void;
@@ -757,6 +846,8 @@ export function WorkspaceView({
 	onExitOverview,
 	onOpenOverview,
 	onAddPane,
+	onOpenFile,
+	onUpdateTab,
 	onFocusPane,
 	onSwapPanes,
 	onSplitPane,
@@ -774,6 +865,7 @@ export function WorkspaceView({
 		originScrollLeft: number;
 		originScrollTop: number;
 	}>(null);
+	const layoutRef = useRef(workspace.layout);
 
 	const registerPaneElement = useCallback((paneId: string, element: HTMLDivElement | null) => {
 		if (!element) {
@@ -782,6 +874,20 @@ export function WorkspaceView({
 		}
 		paneElementsRef.current.set(paneId, element);
 	}, []);
+
+	useEffect(() => {
+		layoutRef.current = workspace.layout;
+	}, [workspace.layout]);
+
+	const applyLayout = useCallback(
+		(transform: (layout: LayoutNode) => LayoutNode) => {
+			const nextLayout = transform(layoutRef.current);
+			layoutRef.current = nextLayout;
+			onUpdateLayout(nextLayout);
+			return nextLayout;
+		},
+		[onUpdateLayout],
+	);
 
 	useEffect(() => {
 		setZoomedPaneId(null);
@@ -854,35 +960,100 @@ export function WorkspaceView({
 
 	const handleClosePane = useCallback(
 		(paneId: string) => {
-			const pane = findPaneById(workspace.layout, paneId);
+			const pane = findPaneById(layoutRef.current, paneId);
 			if (pane) {
-				for (const tab of pane.tabs) sessionManager.closeSession(tab.id);
+				const dirtyEditors = pane.tabs.filter((tab) => tab.kind === "editor" && tab.dirty);
+				if (dirtyEditors.length > 0) {
+					const shouldClose = window.confirm(`Discard unsaved changes in ${dirtyEditors.length} tab${dirtyEditors.length === 1 ? "" : "s"}?`);
+					if (!shouldClose) return;
+				}
+				for (const tab of pane.tabs) {
+					if (isTerminalTab(tab)) sessionManager.closeSession(tab.id);
+				}
 			}
-			onUpdateLayout(removePane(workspace.layout, paneId) ?? workspace.layout);
+			applyLayout((layout) => removePane(layout, paneId) ?? layout);
 			setZoomedPaneId((current) => (current === paneId ? null : current));
 		},
-		[onUpdateLayout, sessionManager, workspace.layout],
+		[applyLayout, sessionManager],
+	);
+
+	const overviewWorldWidth = (Math.max(getLayoutWidthUnits(workspace.layout), WIDTH_UNIT_BASE) / WIDTH_UNIT_BASE) * 1100;
+
+	const resolveNormalizedColumnIndex = useCallback(
+		(paneId: string, desiredColumnIndex: number) => {
+			const columns: OverviewColumnRect[] = [];
+			collectOverviewColumnRects(workspace.layout, 0, overviewWorldWidth, columns);
+			const sourceColumnIndex = columns.findIndex((columnRect) => columnRect.paneIds.includes(paneId));
+			const sourceColumnPaneCount = sourceColumnIndex >= 0 ? columns[sourceColumnIndex]?.paneIds.length ?? 0 : 0;
+			return sourceColumnPaneCount === 1 && sourceColumnIndex >= 0 && desiredColumnIndex > sourceColumnIndex
+				? desiredColumnIndex - 1
+				: desiredColumnIndex;
+		},
+		[overviewWorldWidth, workspace.layout],
+	);
+
+	const columnPaneCountByPaneId = useMemo(() => {
+		const columns: OverviewColumnRect[] = [];
+		collectOverviewColumnRects(workspace.layout, 0, overviewWorldWidth, columns);
+		const counts = new Map<string, number>();
+		for (const column of columns) {
+			const count = column.paneIds.length;
+			for (const paneId of column.paneIds) counts.set(paneId, count);
+		}
+		return counts;
+	}, [overviewWorldWidth, workspace.layout]);
+
+	const canMovePaneToNewColumn = useCallback(
+		(paneId: string) => (columnPaneCountByPaneId.get(paneId) ?? 0) > 1,
+		[columnPaneCountByPaneId],
 	);
 
 	const handleMovePaneToColumn = useCallback(
 		(paneId: string, columnIndex: number) => {
-			const columns: OverviewColumnRect[] = [];
-			collectOverviewColumnRects(workspace.layout, 0, Math.max(getLayoutWidthUnits(workspace.layout), 1) * 1100, columns);
-			const sourceColumnIndex = columns.findIndex((columnRect) => columnRect.paneIds.includes(paneId));
-			const sourceColumnPaneCount = sourceColumnIndex >= 0 ? columns[sourceColumnIndex]?.paneIds.length ?? 0 : 0;
-			const normalizedColumnIndex = sourceColumnPaneCount === 1 && sourceColumnIndex >= 0 && columnIndex > sourceColumnIndex ? columnIndex - 1 : columnIndex;
-			onUpdateLayout(movePaneToColumnIndex(workspace.layout, paneId, normalizedColumnIndex));
+			const normalizedColumnIndex = resolveNormalizedColumnIndex(paneId, columnIndex);
+			applyLayout((layout) => movePaneToColumnIndex(layout, paneId, normalizedColumnIndex));
 			onFocusPane(paneId);
 		},
-		[onFocusPane, onUpdateLayout, workspace.layout],
+		[applyLayout, onFocusPane, resolveNormalizedColumnIndex],
+	);
+
+	const handleMovePaneToNewColumn = useCallback(
+		(paneId: string) => {
+			if (!canMovePaneToNewColumn(paneId)) return;
+			const columns: OverviewColumnRect[] = [];
+			collectOverviewColumnRects(layoutRef.current, 0, overviewWorldWidth, columns);
+			const sourceColumnIndex = columns.findIndex((columnRect) => columnRect.paneIds.includes(paneId));
+			if (sourceColumnIndex < 0) return;
+			const normalizedColumnIndex = resolveNormalizedColumnIndex(paneId, sourceColumnIndex + 1);
+			applyLayout((layout) => movePaneToColumnIndex(layout, paneId, normalizedColumnIndex));
+			onFocusPane(paneId);
+		},
+		[applyLayout, canMovePaneToNewColumn, onFocusPane, overviewWorldWidth, resolveNormalizedColumnIndex],
 	);
 
 	const handleMoveTab = useCallback(
 		(sourcePaneId: string, tabId: string, targetPaneId: string) => {
-			onUpdateLayout(moveTabToPane(workspace.layout, sourcePaneId, tabId, targetPaneId, workspace.path));
+			applyLayout((layout) => moveTabToPane(layout, sourcePaneId, tabId, targetPaneId, workspace.path));
 			onFocusPane(targetPaneId);
 		},
-		[onFocusPane, onUpdateLayout, workspace.layout, workspace.path],
+		[applyLayout, onFocusPane, workspace.path],
+	);
+
+	const handleCloseTab = useCallback(
+		(paneId: string, tabId: string) => {
+			const pane = findPaneById(layoutRef.current, paneId);
+			const tab = pane?.tabs.find((item) => item.id === tabId);
+			if (!tab) return;
+			if (tab.kind === "editor" && tab.dirty) {
+				const shouldClose = window.confirm(`Discard unsaved changes in ${tab.title}?`);
+				if (!shouldClose) return;
+			}
+			if (isTerminalTab(tab)) {
+				sessionManager.closeSession(tab.id);
+			}
+			applyLayout((layout) => closeTab(layout, paneId, tabId, workspace.path));
+		},
+		[applyLayout, sessionManager, workspace.path],
 	);
 
 	const handleTogglePaneZoom = useCallback(
@@ -911,10 +1082,10 @@ export function WorkspaceView({
 				return;
 			}
 
-			onUpdateLayout(movePane(workspace.layout, sourcePaneId, targetPaneId, position));
+			applyLayout((layout) => movePane(layout, sourcePaneId, targetPaneId, position));
 			onFocusPane(sourcePaneId);
 		},
-		[onFocusPane, onSwapPanes, onUpdateLayout, workspace.layout],
+		[applyLayout, onFocusPane, onSwapPanes],
 	);
 
 	const zoomedPane = !overviewOpen && zoomedPaneId ? findPaneById(workspace.layout, zoomedPaneId) : null;
@@ -974,13 +1145,14 @@ export function WorkspaceView({
 						onFocusPane={onFocusPane}
 						onMovePane={handleOverviewMovePane}
 						onInsertColumn={handleMovePaneToColumn}
+						onClosePane={handleClosePane}
 						onExitOverview={onExitOverview}
 					/>
 				) : (
 					<div
 						className="layout-canvas"
 						style={{
-							width: zoomedPane ? "100%" : `${Math.max(getLayoutWidthUnits(workspace.layout), 1) * 100}%`,
+							width: zoomedPane ? "100%" : `${(Math.max(getLayoutWidthUnits(workspace.layout), WIDTH_UNIT_BASE) / WIDTH_UNIT_BASE) * 100}%`,
 							minWidth: "100%",
 						}}
 					>
@@ -994,18 +1166,19 @@ export function WorkspaceView({
 									focused
 									zoomed
 									onFocus={() => onFocusPane(zoomedPane.id)}
+									onMoveToNewColumn={() => handleMovePaneToNewColumn(zoomedPane.id)}
+									canMoveToNewColumn={canMovePaneToNewColumn(zoomedPane.id)}
 									onSplitVertical={() => onSplitPane(zoomedPane.id, "vertical")}
 									onSplitHorizontal={() => onSplitPane(zoomedPane.id, "horizontal")}
 									onClose={() => handleClosePane(zoomedPane.id)}
-									onAddTab={() => onUpdateLayout(addTabToPane(workspace.layout, zoomedPane.id, workspace.path))}
-									onSelectTab={(tabId) => onUpdateLayout(setActiveTab(workspace.layout, zoomedPane.id, tabId))}
-									onCloseTab={(tabId) => {
-										sessionManager.closeSession(tabId);
-										onUpdateLayout(closeTab(workspace.layout, zoomedPane.id, tabId, workspace.path));
-									}}
+									onAddTab={() => applyLayout((layout) => addTabToPane(layout, zoomedPane.id, workspace.path))}
+									onSelectTab={(tabId) => applyLayout((layout) => setActiveTab(layout, zoomedPane.id, tabId))}
+									onCloseTab={(tabId) => handleCloseTab(zoomedPane.id, tabId)}
 									onMoveTab={handleMoveTab}
 									onToggleZoom={() => handleTogglePaneZoom(zoomedPane.id)}
-									onUpdateTabMeta={(tabId, patch) => onUpdateLayout(updateTabMeta(workspace.layout, zoomedPane.id, tabId, patch))}
+									onUpdateTabMeta={(tabId, patch) => applyLayout((layout) => updateTabMeta(layout, zoomedPane.id, tabId, patch))}
+									onOpenFile={onOpenFile}
+									onUpdateTab={(tabId, updater) => onUpdateTab(zoomedPane.id, tabId, updater)}
 								/>
 							</div>
 						) : (
@@ -1018,18 +1191,22 @@ export function WorkspaceView({
 								zoomedPaneId={zoomedPaneId}
 								onFocusPane={onFocusPane}
 								onSplit={(paneId, direction) => onSplitPane(paneId, direction)}
+								onMovePaneToNewColumn={handleMovePaneToNewColumn}
+								canMovePaneToNewColumn={canMovePaneToNewColumn}
 								onClosePane={handleClosePane}
-								onAddTab={(paneId) => onUpdateLayout(addTabToPane(workspace.layout, paneId, workspace.path))}
-								onSelectTab={(paneId, tabId) => onUpdateLayout(setActiveTab(workspace.layout, paneId, tabId))}
-								onCloseTab={(paneId, tabId) => {
-									sessionManager.closeSession(tabId);
-									onUpdateLayout(closeTab(workspace.layout, paneId, tabId, workspace.path));
-								}}
+								onAddTab={(paneId) => applyLayout((layout) => addTabToPane(layout, paneId, workspace.path))}
+								onSelectTab={(paneId, tabId) => applyLayout((layout) => setActiveTab(layout, paneId, tabId))}
+								onCloseTab={handleCloseTab}
 								onMoveTab={handleMoveTab}
 								onTogglePaneZoom={handleTogglePaneZoom}
-								onResize={(splitId, ratio) => onUpdateLayout(updateSplitRatio(workspace.layout, splitId, ratio))}
+								onResizeHorizontalSplit={(splitId, ratio) => applyLayout((layout) => updateSplitRatio(layout, splitId, ratio))}
+								onResizeVerticalSplitBranch={(splitId, branch, deltaRatio) =>
+									applyLayout((layout) => resizeVerticalSplitByDelta(layout, splitId, deltaRatio, branch))
+								}
 								onRegisterPaneElement={registerPaneElement}
-								onUpdateTabMeta={(paneId, tabId, patch) => onUpdateLayout(updateTabMeta(workspace.layout, paneId, tabId, patch))}
+								onUpdateTabMeta={(paneId, tabId, patch) => applyLayout((layout) => updateTabMeta(layout, paneId, tabId, patch))}
+								onOpenFile={(filePath) => onOpenFile(filePath)}
+								onUpdateTab={onUpdateTab}
 							/>
 						)}
 					</div>

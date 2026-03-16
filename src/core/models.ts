@@ -15,22 +15,51 @@ export interface WorkspaceModel {
 	id: string;
 	path: string;
 	customName?: string;
+	accentColor?: string;
 	git: WorkspaceGitStatus;
 	layout: LayoutNode;
 	focusedPaneId?: string;
 }
 
-export interface TerminalTabModel {
+interface PaneTabBase {
 	id: string;
 	title: string;
+	kind: "terminal" | "fileTree" | "editor" | "markdown";
+}
+
+export interface TerminalTabModel extends PaneTabBase {
+	kind: "terminal";
 	status: PaneStatus;
 	shellLabel?: string;
 	message?: string;
 }
 
+export interface FileTreeTabModel extends PaneTabBase {
+	kind: "fileTree";
+	rootPath: string;
+}
+
+export interface EditorTabModel extends PaneTabBase {
+	kind: "editor";
+	filePath: string;
+	language: string;
+	content: string;
+	savedContent: string;
+	dirty: boolean;
+	message?: string;
+}
+
+export interface MarkdownTabModel extends PaneTabBase {
+	kind: "markdown";
+	filePath: string;
+	content: string;
+}
+
+export type PaneTabModel = TerminalTabModel | FileTreeTabModel | EditorTabModel | MarkdownTabModel;
+
 export interface PaneModel {
 	id: string;
-	tabs: TerminalTabModel[];
+	tabs: PaneTabModel[];
 	activeTabId: string;
 }
 

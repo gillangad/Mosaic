@@ -194,51 +194,6 @@ const baseThemes: Record<string, MosaicTheme> = {
 	},
 
 
-	ember: {
-		id: "ember",
-		name: "Ember",
-		kind: "dark",
-
-		bgVoid: "#0e0804",
-		bgSurface: "#161009",
-		bgWell: "#161009",
-
-		borderDim: "rgba(214, 156, 78, 0.10)",
-		borderGlow: "rgba(214, 156, 78, 0.22)",
-
-		textPrimary: "#f0dcc0",
-		textSecondary: "#9a7e5e",
-		textMuted: "#5a4430",
-
-		statusSuccess: "#b5d07a",
-		statusWarn: "#e8a735",
-		statusError: "#d44830",
-
-		accents: {
-			product: "#e8a735",
-			engineering: "#d07a4a",
-			research: "#c97ab0",
-			ops: "#b5d07a",
-		},
-
-		terminal: {
-			foreground: "#e0cbb0",
-			cursor: "#e8a735",
-			cursorAccent: "#161009",
-			selectionBackground: "rgba(232, 167, 53, 0.12)",
-			black: "#0e0804",
-			brightBlack: "#5a4430",
-			red: "#d44830",
-			green: "#b5d07a",
-			yellow: "#e8a735",
-			blue: "#6a9ec0",
-			magenta: "#c97ab0",
-			cyan: "#7abcb0",
-			white: "#e0cbb0",
-			brightWhite: "#f5ead8",
-		},
-	},
-
 	oxide: {
 		id: "oxide",
 		name: "Oxide",
@@ -423,3 +378,54 @@ const baseThemes: Record<string, MosaicTheme> = {
 export const themes = enforceThemeConstraints(baseThemes);
 export const themeIds = Object.keys(themes) as Array<keyof typeof themes>;
 export const defaultThemeId = "carbon";
+
+function toHueSortKey(color: string) {
+	const normalized = color.trim();
+	const hex = normalized.startsWith("#") ? normalized.slice(1) : normalized;
+	if (!(hex.length === 3 || hex.length === 6)) return { hue: 0, saturation: 0, lightness: 0 };
+	const full = hex.length === 3 ? hex.split("").map((part) => `${part}${part}`).join("") : hex;
+	const red = Number.parseInt(full.slice(0, 2), 16) / 255;
+	const green = Number.parseInt(full.slice(2, 4), 16) / 255;
+	const blue = Number.parseInt(full.slice(4, 6), 16) / 255;
+	if (Number.isNaN(red) || Number.isNaN(green) || Number.isNaN(blue)) return { hue: 0, saturation: 0, lightness: 0 };
+
+	const max = Math.max(red, green, blue);
+	const min = Math.min(red, green, blue);
+	const delta = max - min;
+	const lightness = (max + min) / 2;
+	const saturation = delta === 0 ? 0 : delta / (1 - Math.abs(2 * lightness - 1));
+
+	let hue = 0;
+	if (delta !== 0) {
+		if (max === red) hue = ((green - blue) / delta) % 6;
+		else if (max === green) hue = (blue - red) / delta + 2;
+		else hue = (red - green) / delta + 4;
+		hue *= 60;
+		if (hue < 0) hue += 360;
+	}
+
+	return { hue, saturation, lightness };
+}
+
+export const accentPalette: string[] = (() => {
+	const seen = new Set<string>();
+	const palette: string[] = [];
+	for (const theme of Object.values(themes)) {
+		for (const color of Object.values(theme.accents)) {
+			const lower = color.toLowerCase();
+			if (!seen.has(lower)) {
+				seen.add(lower);
+				palette.push(color);
+			}
+		}
+	}
+
+	return palette.sort((left, right) => {
+		const leftKey = toHueSortKey(left);
+		const rightKey = toHueSortKey(right);
+		if (leftKey.hue !== rightKey.hue) return leftKey.hue - rightKey.hue;
+		if (leftKey.saturation !== rightKey.saturation) return rightKey.saturation - leftKey.saturation;
+		if (leftKey.lightness !== rightKey.lightness) return leftKey.lightness - rightKey.lightness;
+		return left.localeCompare(right);
+	});
+})();

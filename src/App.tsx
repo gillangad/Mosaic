@@ -2,11 +2,31 @@ import { AnimatePresence, motion, Reorder, useDragControls } from "framer-motion
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent } from "react";
 import { createPortal } from "react-dom";
 import { WorkspaceView } from "./WorkspaceView";
-import { addTabToPane, appendPaneToRight, closeTab, createPaneNode, findAdjacentPaneId, findFirstPaneId, findLastPaneId, findPaneById, getAllTabIds, rehydrateLayout, resizeFromPane, setActiveTab, splitNode, swapPanes } from "./core/layout";
+import { FileTreeSidebar } from "./components/FileTreeSidebar";
+import {
+	addTabModelToPane,
+	addTabToPane,
+	appendPaneToRight,
+	closeTab,
+	createPaneNode,
+	findAdjacentPaneId,
+	findFirstPaneId,
+	findLastPaneId,
+	findPaneById,
+	findTabByFilePath,
+	getAllTabIds,
+	rehydrateLayout,
+	resizeFromPane,
+	setActiveTab,
+	splitNode,
+	swapPanes,
+	updatePaneTab,
+} from "./core/layout";
 import type { FocusDirection } from "./core/layout";
-import type { LayoutNode, WorkspaceModel, WorkspaceSelection } from "./core/models";
+import type { LayoutNode, PaneTabModel, WorkspaceModel, WorkspaceSelection } from "./core/models";
+import { createEditorTab, createMarkdownTab, createTerminalTab, isMarkdownPath, isTerminalTab, normalizeFilePath } from "./core/pane-tabs";
 import type { MosaicTheme } from "./core/themes";
-import { defaultThemeId, themeIds, themes } from "./core/themes";
+import { accentPalette, defaultThemeId, themeIds, themes } from "./core/themes";
 import { getWorkspaceDisplayName, getWorkspaceTabLabel, serializeWorkspaceState } from "./core/workspaces";
 import { useSessionManager } from "./core/terminal-backend-context";
 
@@ -22,6 +42,8 @@ interface ShortcutDefinition {
 const STORAGE_KEYS = {
 	themeId: "mosaic.themeId",
 	tabOrientation: "mosaic.tabOrientation",
+	fileTreeCollapsed: "mosaic.fileTreeCollapsed",
+	fileTreeWidth: "mosaic.fileTreeWidth",
 	workspaces: "mosaic.workspaces",
 } as const;
 
@@ -32,7 +54,6 @@ const LEGACY_THEME_IDS: Record<string, ThemeId> = {
 	ink: "carbon",
 };
 
-const ACCENT_KEYS = ["product", "engineering", "research", "ops"] as const;
 const SHORTCUTS: ShortcutDefinition[] = [
 	{ action: "Open workspace", keys: "Ctrl Shift O" },
 	{ action: "New pane", keys: "Ctrl Shift Enter" },
@@ -51,6 +72,13 @@ const SHORTCUTS: ShortcutDefinition[] = [
 ];
 
 const GIT_POLL_INTERVAL_MS = 30_000;
+const FILE_TREE_MIN_WIDTH = 180;
+const FILE_TREE_MAX_WIDTH = 520;
+const FILE_TREE_DEFAULT_WIDTH = 270;
+
+function clampNumber(value: number, min: number, max: number) {
+	return Math.min(max, Math.max(min, value));
+}
 
 function normalizeWorkspacePath(value: string) {
 	return value.replace(/[\\/]+$/, "");
@@ -58,7 +86,11 @@ function normalizeWorkspacePath(value: string) {
 
 function countBusyTabs(node: LayoutNode): number {
 	if (node.type === "pane") {
-		return node.pane.tabs.reduce((count, tab) => count + (tab.status === "busy" ? 1 : 0), 0);
+		return node.pane.tabs.reduce((count, tab) => {
+			if (tab.kind === "editor" && tab.dirty) return count + 1;
+			if (isTerminalTab(tab) && tab.status === "busy") return count + 1;
+			return count;
+		}, 0);
 	}
 	return countBusyTabs(node.first) + countBusyTabs(node.second);
 }
@@ -78,6 +110,63 @@ function isGitStatusEqual(left: WorkspaceModel["git"], right: WorkspaceModel["gi
 		left.changeCount === right.changeCount &&
 		left.rootPath === right.rootPath
 	);
+}
+
+function findFirstNonFileTreePaneId(node: LayoutNode): string | null {
+	if (node.type === "pane") {
+		const activeTab = node.pane.tabs.find((tab) => tab.id === node.pane.activeTabId) ?? node.pane.tabs[0];
+		return activeTab?.kind !== "fileTree" ? node.pane.id : null;
+	}
+
+	return findFirstNonFileTreePaneId(node.first) ?? findFirstNonFileTreePaneId(node.second);
+}
+
+function resolveFileOpenTargetPaneId(layout: LayoutNode, focusedPaneId?: string) {
+	if (focusedPaneId) {
+		const focusedPane = findPaneById(layout, focusedPaneId);
+		const activeTab = focusedPane?.tabs.find((tab) => tab.id === focusedPane.activeTabId) ?? focusedPane?.tabs[0];
+		if (focusedPane && activeTab?.kind !== "fileTree") return focusedPane.id;
+	}
+
+	return findFirstNonFileTreePaneId(layout) ?? findFirstPaneId(layout);
+}
+
+function detachFileTreeTabs(layout: LayoutNode, workspacePath: string): LayoutNode {
+	if (layout.type === "pane") {
+		const keptTabs = layout.pane.tabs.filter((tab) => tab.kind !== "fileTree");
+		if (keptTabs.length === layout.pane.tabs.length) return layout;
+		const nextTabs = keptTabs.length > 0 ? keptTabs : [createTerminalTab(workspacePath)];
+		const nextActiveTabId = nextTabs.some((tab) => tab.id === layout.pane.activeTabId) ? layout.pane.activeTabId : nextTabs[0].id;
+		return {
+			...layout,
+			pane: {
+				...layout.pane,
+				tabs: nextTabs,
+				activeTabId: nextActiveTabId,
+			},
+		};
+	}
+
+	const first = detachFileTreeTabs(layout.first, workspacePath);
+	const second = detachFileTreeTabs(layout.second, workspacePath);
+	if (first === layout.first && second === layout.second) return layout;
+	return {
+		...layout,
+		first,
+		second,
+	};
+}
+
+function getCanvasSurface(theme: MosaicTheme) {
+	return theme.kind === "light"
+		? `color-mix(in srgb, ${theme.bgWell} 86%, ${theme.bgSurface})`
+		: `color-mix(in srgb, ${theme.bgSurface} 72%, #8b8b96 8%)`;
+}
+
+function getCanvasBorder(theme: MosaicTheme) {
+	return theme.kind === "light"
+		? `color-mix(in srgb, ${theme.borderDim} 80%, ${theme.textPrimary} 4%)`
+		: `color-mix(in srgb, ${theme.borderDim} 70%, transparent)`;
 }
 
 function buildThemeVars(theme: MosaicTheme) {
@@ -101,11 +190,14 @@ function buildThemeVars(theme: MosaicTheme) {
 		["--bg-elevated" as string]: theme.kind === "light"
 			? `color-mix(in srgb, ${theme.bgSurface} 97%, ${theme.textPrimary})`
 			: `color-mix(in srgb, ${theme.bgSurface} 85%, ${theme.textPrimary})`,
+		["--canvas-surface" as string]: getCanvasSurface(theme),
+		["--canvas-border" as string]: getCanvasBorder(theme),
 	};
 }
 
-function getWorkspaceAccent(theme: MosaicTheme, index: number) {
-	return theme.accents[ACCENT_KEYS[index % ACCENT_KEYS.length]];
+function getWorkspaceAccent(index: number, workspace?: WorkspaceModel) {
+	if (workspace?.accentColor) return workspace.accentColor;
+	return accentPalette[index % accentPalette.length];
 }
 
 function SkinSwatch({ theme }: { theme: MosaicTheme }) {
@@ -115,6 +207,16 @@ function SkinSwatch({ theme }: { theme: MosaicTheme }) {
 			<span className="skin-swatch-surface" style={{ background: theme.bgSurface }} />
 			<span className="skin-swatch-well" style={{ background: theme.bgWell }} />
 		</span>
+	);
+}
+
+function FileTreeToggleIcon() {
+	return (
+		<svg className="file-tree-toggle-icon" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+			<path d="M1.5 3h4l1.2 1.4H14.5v8.1H1.5z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
+			<path d="M5.2 6.5h6.1" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" />
+			<path d="M5.2 8.8h4.6" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" />
+		</svg>
 	);
 }
 
@@ -131,6 +233,18 @@ function readStoredOrientation() {
 	return window.localStorage.getItem(STORAGE_KEYS.tabOrientation) === "horizontal" ? "horizontal" : "vertical";
 }
 
+function readStoredFileTreeCollapsed() {
+	if (typeof window === "undefined") return false;
+	return window.localStorage.getItem(STORAGE_KEYS.fileTreeCollapsed) === "true";
+}
+
+function readStoredFileTreeWidth() {
+	if (typeof window === "undefined") return FILE_TREE_DEFAULT_WIDTH;
+	const raw = window.localStorage.getItem(STORAGE_KEYS.fileTreeWidth);
+	const parsed = raw ? Number.parseFloat(raw) : Number.NaN;
+	if (!Number.isFinite(parsed)) return FILE_TREE_DEFAULT_WIDTH;
+	return clampNumber(parsed, FILE_TREE_MIN_WIDTH, FILE_TREE_MAX_WIDTH);
+}
 
 interface WorkspaceTabItemProps {
 	workspace: WorkspaceModel;
@@ -144,6 +258,7 @@ interface WorkspaceTabItemProps {
 	onRenameChange: (value: string) => void;
 	onCommitRename: () => void;
 	onCancelRename: () => void;
+	onChangeAccent: (color: string) => void;
 }
 
 function WorkspaceTabItem({
@@ -158,10 +273,15 @@ function WorkspaceTabItem({
 	onRenameChange,
 	onCommitRename,
 	onCancelRename,
+	onChangeAccent,
 }: WorkspaceTabItemProps) {
 	const dragControls = useDragControls();
 	const isDraggingRef = useRef(false);
 	const renameInputRef = useRef<HTMLInputElement | null>(null);
+	const [accentPickerOpen, setAccentPickerOpen] = useState(false);
+	const accentDotRef = useRef<HTMLButtonElement | null>(null);
+	const accentPickerRef = useRef<HTMLDivElement | null>(null);
+	const [accentPickerPosition, setAccentPickerPosition] = useState({ left: 0, top: 0 });
 
 	useEffect(() => {
 		if (!isRenaming) return;
@@ -169,12 +289,51 @@ function WorkspaceTabItem({
 		renameInputRef.current?.select();
 	}, [isRenaming]);
 
+	useEffect(() => {
+		if (!isActive && accentPickerOpen) {
+			setAccentPickerOpen(false);
+		}
+	}, [accentPickerOpen, isActive]);
+
+	useEffect(() => {
+		if (!accentPickerOpen) return;
+		const updatePosition = () => {
+			const dotRect = accentDotRef.current?.getBoundingClientRect();
+			if (!dotRect) return;
+			setAccentPickerPosition({
+				left: Math.max(8, Math.min(dotRect.left, window.innerWidth - 160)),
+				top: Math.min(window.innerHeight - 8, dotRect.bottom + 6),
+			});
+		};
+		const handlePointerDown = (event: MouseEvent) => {
+			const target = event.target as Node;
+			if (accentDotRef.current?.contains(target)) return;
+			if (accentPickerRef.current?.contains(target)) return;
+			setAccentPickerOpen(false);
+		};
+		const handleKeyDown = (event: KeyboardEvent) => {
+			if (event.key === "Escape") setAccentPickerOpen(false);
+		};
+		updatePosition();
+		window.addEventListener("resize", updatePosition);
+		window.addEventListener("scroll", updatePosition, true);
+		window.addEventListener("mousedown", handlePointerDown);
+		window.addEventListener("keydown", handleKeyDown);
+		return () => {
+			window.removeEventListener("resize", updatePosition);
+			window.removeEventListener("scroll", updatePosition, true);
+			window.removeEventListener("mousedown", handlePointerDown);
+			window.removeEventListener("keydown", handleKeyDown);
+		};
+	}, [accentPickerOpen]);
+
 	return (
 		<Reorder.Item
 			value={workspace}
 			dragListener={false}
 			dragControls={dragControls}
 			className={`workspace-tab ${isActive ? "active" : ""} ${isRenaming ? "renaming" : ""}`}
+			data-workspace-tab-id={workspace.id}
 			style={{ ["--workspace-accent" as string]: accent }}
 			onDragStart={() => {
 				if (isRenaming) return;
@@ -186,6 +345,53 @@ function WorkspaceTabItem({
 				}, 0);
 			}}
 		>
+			<button
+				ref={accentDotRef}
+				type="button"
+				className="workspace-accent-dot"
+				style={{ background: accent }}
+				onClick={(event) => {
+					event.stopPropagation();
+					if (!isActive || isRenaming) {
+						onSelect();
+						return;
+					}
+					setAccentPickerOpen((current) => !current);
+				}}
+				onPointerDown={(event) => event.stopPropagation()}
+				aria-label={isActive ? "Change workspace accent color" : `Open workspace ${getWorkspaceTabLabel(workspace)}`}
+				aria-expanded={isActive ? accentPickerOpen : false}
+			/>
+			{accentPickerOpen
+				? createPortal(
+					<div
+						ref={accentPickerRef}
+						className="accent-picker-popup"
+						style={{
+							position: "fixed",
+							left: accentPickerPosition.left,
+							top: accentPickerPosition.top,
+						}}
+						onPointerDown={(event) => event.stopPropagation()}
+					>
+						{accentPalette.map((color) => (
+							<button
+								key={color}
+								type="button"
+								className={`accent-picker-swatch ${color.toLowerCase() === accent.toLowerCase() ? "active" : ""}`}
+								style={{ background: color }}
+								onClick={() => {
+									onChangeAccent(color);
+									setAccentPickerOpen(false);
+								}}
+								title={color.toUpperCase()}
+								aria-label={`Accent ${color.toUpperCase()}`}
+							/>
+						))}
+					</div>,
+					document.body,
+				)
+				: null}
 			<button
 				type="button"
 				className="workspace-tab-main"
@@ -269,10 +475,16 @@ export function App() {
 	const [isHydrating, setIsHydrating] = useState(true);
 	const [settingsOpen, setSettingsOpen] = useState(false);
 	const [settingsView, setSettingsView] = useState<SettingsView>("root");
+	const [fileTreeOpen, setFileTreeOpen] = useState(() => !readStoredFileTreeCollapsed());
 	const topSettingsButtonRef = useRef<HTMLButtonElement>(null);
 	const railSettingsButtonRef = useRef<HTMLButtonElement>(null);
+	const topFileTreeButtonRef = useRef<HTMLButtonElement>(null);
+	const railFileTreeButtonRef = useRef<HTMLButtonElement>(null);
 	const settingsPanelRef = useRef<HTMLDivElement>(null);
+	const fileTreePanelRef = useRef<HTMLDivElement>(null);
+	const workspacePillbarRef = useRef<HTMLDivElement>(null);
 	const [settingsPanelPosition, setSettingsPanelPosition] = useState({ left: 8, top: 44, maxHeight: 520 });
+	const [fileTreePanelPosition, setFileTreePanelPosition] = useState({ left: 8, top: 52, maxHeight: 520, bubbleLeft: 18 });
 	const [overviewOpen, setOverviewOpen] = useState(false);
 	const [renamingWorkspaceId, setRenamingWorkspaceId] = useState<string | null>(null);
 	const [workspaceRenameDraft, setWorkspaceRenameDraft] = useState("");
@@ -310,8 +522,8 @@ export function App() {
 
 			const busyCount = countBusyTabs(workspace.layout);
 			if (busyCount > 0 && typeof window !== "undefined") {
-				const label = busyCount === 1 ? "terminal" : "terminals";
-				const shouldClose = window.confirm(`${busyCount} ${label} busy — close anyway?`);
+				const label = busyCount === 1 ? "tab" : "tabs";
+				const shouldClose = window.confirm(`${busyCount} ${label} have running work or unsaved changes — close anyway?`);
 				if (!shouldClose) return;
 			}
 
@@ -362,6 +574,7 @@ export function App() {
 				{
 					id: crypto.randomUUID(),
 					path: selection.path,
+					accentColor: accentPalette[current.length % accentPalette.length],
 					git: selection.git,
 					layout,
 					focusedPaneId: findFirstPaneId(layout),
@@ -437,6 +650,16 @@ export function App() {
 		setWorkspaceRenameDraft("");
 	}, []);
 
+	const changeWorkspaceAccent = useCallback(
+		(workspaceId: string, color: string) => {
+			updateWorkspace(workspaceId, (workspace) => ({
+				...workspace,
+				accentColor: color,
+			}));
+		},
+		[updateWorkspace],
+	);
+
 	useEffect(() => {
 		if (typeof window === "undefined" || typeof window.mosaic === "undefined") {
 			setIsHydrating(false);
@@ -449,9 +672,9 @@ export function App() {
 			return;
 		}
 
-		let stored: Array<{ id: string; path: string; customName?: string; layout?: LayoutNode; focusedPaneId?: string }> = [];
+		let stored: Array<{ id: string; path: string; customName?: string; accentColor?: string; layout?: LayoutNode; focusedPaneId?: string }> = [];
 		try {
-			stored = JSON.parse(raw) as Array<{ id: string; path: string; customName?: string; layout?: LayoutNode; focusedPaneId?: string }>;
+			stored = JSON.parse(raw) as Array<{ id: string; path: string; customName?: string; accentColor?: string; layout?: LayoutNode; focusedPaneId?: string }>;
 		} catch {
 			window.localStorage.removeItem(STORAGE_KEYS.workspaces);
 			setIsHydrating(false);
@@ -459,11 +682,15 @@ export function App() {
 		}
 
 		Promise.all(
-			stored.map(async (workspace) => {
+			stored.map(async (workspace, index) => {
 				try {
-					const layout = rehydrateLayout(workspace.layout, workspace.path);
+					const layout = detachFileTreeTabs(rehydrateLayout(workspace.layout, workspace.path), workspace.path);
 					return {
 						...workspace,
+						accentColor:
+							typeof workspace.accentColor === "string" && workspace.accentColor.trim().length > 0
+								? workspace.accentColor
+								: accentPalette[index % accentPalette.length],
 						git: (await window.mosaic.inspectWorkspace(workspace.path)).git,
 						layout,
 						focusedPaneId: workspace.focusedPaneId ?? findFirstPaneId(layout),
@@ -561,6 +788,11 @@ export function App() {
 	}, [tabOrientation]);
 
 	useEffect(() => {
+		if (typeof window === "undefined") return;
+		window.localStorage.setItem(STORAGE_KEYS.fileTreeCollapsed, fileTreeOpen ? "false" : "true");
+	}, [fileTreeOpen]);
+
+	useEffect(() => {
 		if (typeof window === "undefined" || isHydrating) return;
 		window.localStorage.setItem(STORAGE_KEYS.workspaces, JSON.stringify(serializeWorkspaceState(workspaces)));
 	}, [isHydrating, workspaces]);
@@ -571,12 +803,13 @@ export function App() {
 
 	useEffect(() => {
 		if (typeof window === "undefined" || typeof window.mosaic?.updateTitleBarOverlay !== "function") return;
+		const canvasSurface = getCanvasSurface(currentTheme);
 		window.mosaic.updateTitleBarOverlay({
-			backgroundColor: currentTheme.bgVoid,
-			overlayColor: currentTheme.bgVoid,
+			backgroundColor: canvasSurface,
+			overlayColor: canvasSurface,
 			symbolColor: currentTheme.kind === "light" ? "#3f3f46" : "#a1a1aa",
 		});
-	}, [currentTheme.bgVoid, currentTheme.kind]);
+	}, [currentTheme]);
 
 	useEffect(() => {
 		if (!renamingWorkspaceId) return;
@@ -590,6 +823,10 @@ export function App() {
 	const closeSettings = useCallback(() => {
 		setSettingsOpen(false);
 		setSettingsView("root");
+	}, []);
+
+	const closeFileTree = useCallback(() => {
+		setFileTreeOpen(false);
 	}, []);
 
 	const updateSettingsPanelPosition = useCallback(() => {
@@ -625,6 +862,37 @@ export function App() {
 		});
 	}, [tabOrientation]);
 
+	const updateFileTreePanelPosition = useCallback(() => {
+		if (typeof window === "undefined") return;
+
+		const margin = 8;
+		const anchorButton = tabOrientation === "horizontal" ? topFileTreeButtonRef.current : railFileTreeButtonRef.current;
+		const buttonRect = anchorButton?.getBoundingClientRect();
+		const panelRect = fileTreePanelRef.current?.getBoundingClientRect();
+		const panelWidth = panelRect?.width ?? 320;
+		const panelHeight = panelRect?.height ?? 520;
+
+		let left = buttonRect ? buttonRect.left - 4 : margin;
+		left = Math.min(Math.max(left, margin), Math.max(margin, window.innerWidth - panelWidth - margin));
+
+		let top = buttonRect ? buttonRect.bottom - 10 : 48;
+		top = Math.min(Math.max(top, margin), Math.max(margin, window.innerHeight - panelHeight - margin));
+		const maxHeight = Math.max(320, window.innerHeight - top - margin);
+		const bubbleLeft = buttonRect ? clampNumber(buttonRect.left + buttonRect.width / 2 - left - 16, 16, panelWidth - 40) : 18;
+
+		setFileTreePanelPosition((current) => {
+			if (
+				Math.abs(current.left - left) < 0.5 &&
+				Math.abs(current.top - top) < 0.5 &&
+				Math.abs(current.maxHeight - maxHeight) < 0.5 &&
+				Math.abs(current.bubbleLeft - bubbleLeft) < 0.5
+			) {
+				return current;
+			}
+			return { left, top, maxHeight, bubbleLeft };
+		});
+	}, [tabOrientation]);
+
 	useLayoutEffect(() => {
 		if (!settingsOpen) return;
 		updateSettingsPanelPosition();
@@ -637,13 +905,37 @@ export function App() {
 		};
 	}, [settingsOpen, settingsView, tabOrientation, workspaces.length, updateSettingsPanelPosition]);
 
+	useLayoutEffect(() => {
+		if (!fileTreeOpen) return;
+		updateFileTreePanelPosition();
+		const rafId = window.requestAnimationFrame(updateFileTreePanelPosition);
+		const handleResize = () => updateFileTreePanelPosition();
+		window.addEventListener("resize", handleResize);
+		return () => {
+			window.cancelAnimationFrame(rafId);
+			window.removeEventListener("resize", handleResize);
+		};
+	}, [fileTreeOpen, tabOrientation, activeIndex, updateFileTreePanelPosition]);
+
 	const activeWorkspace = workspaces[activeIndex];
 	const focusedPaneId = activeWorkspace ? activeWorkspace.focusedPaneId ?? findFirstPaneId(activeWorkspace.layout) : null;
 	const focusedPane = activeWorkspace && focusedPaneId ? findPaneById(activeWorkspace.layout, focusedPaneId) : null;
 
 	useEffect(() => {
-		if (!activeWorkspace) setOverviewOpen(false);
+		if (!activeWorkspace) {
+			setOverviewOpen(false);
+			setFileTreeOpen(false);
+		}
 	}, [activeWorkspace]);
+
+	useEffect(() => {
+		if (typeof window === "undefined" || tabOrientation !== "horizontal") return;
+		const container = workspacePillbarRef.current;
+		const activeTab = container?.querySelector<HTMLElement>(`.workspace-tab[data-workspace-tab-id="${activeWorkspace?.id ?? ""}"]`);
+		if (!container || !activeTab) return;
+		const targetLeft = activeTab.offsetLeft - (container.clientWidth - activeTab.clientWidth) / 2;
+		container.scrollTo({ left: Math.max(0, targetLeft), behavior: "smooth" });
+	}, [activeWorkspace?.id, tabOrientation, workspaces.length]);
 
 	const openSettings = useCallback((view: SettingsView = "root") => {
 		setSettingsOpen(true);
@@ -661,6 +953,11 @@ export function App() {
 		[updateWorkspace],
 	);
 
+	const toggleFileTree = useCallback(() => {
+		if (!activeWorkspace) return;
+		setFileTreeOpen((current) => !current);
+	}, [activeWorkspace]);
+
 	const addPaneToActiveWorkspace = useCallback(() => {
 		if (!activeWorkspace) return;
 		const nextLayout = appendPaneToRight(activeWorkspace.layout, activeWorkspace.path);
@@ -671,6 +968,57 @@ export function App() {
 			focusedPaneId: insertedPaneId,
 		}));
 	}, [activeWorkspace, updateWorkspace]);
+
+
+	const openFileFromTree = useCallback(
+		async (workspaceId: string, filePath: string) => {
+			if (typeof window === "undefined" || typeof window.mosaic === "undefined") return;
+			const normalizedPath = normalizeFilePath(filePath);
+			const workspace = workspacesRef.current.find((item) => item.id === workspaceId);
+			if (!workspace) return;
+
+			const existingTab = findTabByFilePath(workspace.layout, normalizedPath);
+			if (existingTab) {
+				updateWorkspace(workspaceId, (currentWorkspace) => ({
+					...currentWorkspace,
+					layout: setActiveTab(currentWorkspace.layout, existingTab.paneId, existingTab.tabId),
+					focusedPaneId: existingTab.paneId,
+				}));
+				return;
+			}
+
+			let content: string;
+			try {
+				content = await window.mosaic.readFile(normalizedPath);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : "Failed to read file.";
+				window.alert(message);
+				return;
+			}
+
+			updateWorkspace(workspaceId, (currentWorkspace) => {
+				const duplicate = findTabByFilePath(currentWorkspace.layout, normalizedPath);
+				if (duplicate) {
+					return {
+						...currentWorkspace,
+						layout: setActiveTab(currentWorkspace.layout, duplicate.paneId, duplicate.tabId),
+						focusedPaneId: duplicate.paneId,
+					};
+				}
+
+				const targetPaneId = resolveFileOpenTargetPaneId(currentWorkspace.layout, currentWorkspace.focusedPaneId);
+				const tab = isMarkdownPath(normalizedPath)
+					? createMarkdownTab(normalizedPath, content)
+					: createEditorTab(normalizedPath, content);
+				return {
+					...currentWorkspace,
+					layout: addTabModelToPane(currentWorkspace.layout, targetPaneId, tab),
+					focusedPaneId: targetPaneId,
+				};
+			});
+		},
+		[updateWorkspace],
+	);
 
 	const splitFocusedPane = useCallback(
 		(direction: "horizontal" | "vertical") => {
@@ -697,8 +1045,16 @@ export function App() {
 
 	const closeFocusedTab = useCallback(() => {
 		if (!activeWorkspace || !focusedPaneId || !focusedPane) return;
-		sessionManager.closeSession(focusedPane.activeTabId);
-		const nextLayout = closeTab(activeWorkspace.layout, focusedPaneId, focusedPane.activeTabId, activeWorkspace.path);
+		const activeTab = focusedPane.tabs.find((tab) => tab.id === focusedPane.activeTabId) ?? focusedPane.tabs[0];
+		if (!activeTab) return;
+		if (activeTab.kind === "editor" && activeTab.dirty) {
+			const shouldClose = window.confirm(`Discard unsaved changes in ${activeTab.title}?`);
+			if (!shouldClose) return;
+		}
+		if (isTerminalTab(activeTab)) {
+			sessionManager.closeSession(activeTab.id);
+		}
+		const nextLayout = closeTab(activeWorkspace.layout, focusedPaneId, activeTab.id, activeWorkspace.path);
 		updateWorkspace(activeWorkspace.id, (workspace) => ({
 			...workspace,
 			layout: nextLayout,
@@ -719,6 +1075,16 @@ export function App() {
 			}));
 		},
 		[activeWorkspace, focusedPane, focusedPaneId, updateWorkspace],
+	);
+
+	const updateWorkspaceTab = useCallback(
+		(workspaceId: string, paneId: string, tabId: string, updater: (tab: PaneTabModel) => PaneTabModel) => {
+			updateWorkspace(workspaceId, (workspace) => ({
+				...workspace,
+				layout: updatePaneTab(workspace.layout, paneId, tabId, updater),
+			}));
+		},
+		[updateWorkspace],
 	);
 
 	const moveFocus = useCallback(
@@ -756,6 +1122,12 @@ export function App() {
 			if (event.key === "Escape" && settingsOpen) {
 				event.preventDefault();
 				closeSettings();
+				return;
+			}
+
+			if (event.key === "Escape" && fileTreeOpen) {
+				event.preventDefault();
+				closeFileTree();
 				return;
 			}
 
@@ -867,8 +1239,10 @@ export function App() {
 		addTabToFocusedPane,
 		addWorkspace,
 		cancelWorkspaceRename,
+		closeFileTree,
 		closeFocusedTab,
 		closeSettings,
+		fileTreeOpen,
 		goTo,
 		moveFocus,
 		openSettings,
@@ -881,7 +1255,7 @@ export function App() {
 		toggleOverview,
 	]);
 
-	const activeWorkspaceAccent = activeWorkspace ? getWorkspaceAccent(currentTheme, activeIndex) : currentTheme.accents.product;
+	const activeWorkspaceAccent = activeWorkspace ? getWorkspaceAccent(activeIndex, activeWorkspace) : currentTheme.accents.product;
 	const appShellStyle = useMemo(
 		() => ({
 			...shellStyle,
@@ -890,6 +1264,7 @@ export function App() {
 		[shellStyle, activeWorkspaceAccent],
 	);
 	const isVertical = tabOrientation === "vertical";
+	const hasActiveWorkspace = Boolean(activeWorkspace);
 	const workspaceTabs = (
 		<Reorder.Group
 			as="nav"
@@ -908,7 +1283,7 @@ export function App() {
 						key={workspace.id}
 						workspace={workspace}
 						isActive={index === activeIndex}
-						accent={getWorkspaceAccent(currentTheme, index)}
+						accent={getWorkspaceAccent(index, workspace)}
 						isRenaming={isRenaming}
 						renameValue={isRenaming ? workspaceRenameDraft : ""}
 						onSelect={() => {
@@ -922,14 +1297,43 @@ export function App() {
 						onRenameChange={setWorkspaceRenameDraft}
 						onCommitRename={() => commitWorkspaceRename(workspace.id)}
 						onCancelRename={cancelWorkspaceRename}
+						onChangeAccent={(color) => changeWorkspaceAccent(workspace.id, color)}
 					/>
 				);
 			})}
-			<button type="button" className="icon-button workspace-tab-add" onClick={addWorkspace} aria-label="Open directory">
-				+
-			</button>
 		</Reorder.Group>
 	);
+
+	const fileTreePanel = fileTreeOpen && activeWorkspace && typeof document !== "undefined"
+		? createPortal(
+			<>
+				<button
+					type="button"
+					className="file-tree-scrim"
+					onMouseDown={(event) => {
+						event.preventDefault();
+						closeFileTree();
+					}}
+					aria-label="Close file tree"
+				/>
+				<div
+					ref={fileTreePanelRef}
+					className={`file-tree-popover ${tabOrientation === "vertical" ? "rail" : "topbar"}`}
+					style={{
+						left: `${fileTreePanelPosition.left}px`,
+						top: `${fileTreePanelPosition.top}px`,
+						maxHeight: `${fileTreePanelPosition.maxHeight}px`,
+						["--file-tree-bubble-left" as string]: `${fileTreePanelPosition.bubbleLeft}px`,
+					}}
+					role="dialog"
+					aria-label="File tree"
+				>
+					<FileTreeSidebar rootPath={activeWorkspace.path} onOpenFile={(filePath) => void openFileFromTree(activeWorkspace.id, filePath)} />
+				</div>
+			</>,
+			document.body,
+		)
+		: null;
 
 	const settingsPanel = settingsOpen && typeof document !== "undefined"
 		? createPortal(
@@ -1034,35 +1438,31 @@ export function App() {
 		<div className="app-shell" style={appShellStyle}>
 			{tabOrientation === "horizontal" ? (
 				<header className="topbar titlebar-drag">
-					<div className="settings-anchor settings-anchor-leading topbar-leading-settings">
-						<button
-							ref={topSettingsButtonRef}
-							type="button"
-							className={`icon-button ${settingsOpen ? "active" : ""}`}
-							onClick={() => {
-								if (settingsOpen) {
-									closeSettings();
-									return;
-								}
-								openSettings();
-							}}
-							aria-label="Open settings"
-						>
-							⚙
-						</button>
-					</div>
-					{workspaceTabs}
-				</header>
-			) : null}
-
-			{tabOrientation === "vertical" ? <div className="titlebar-strip titlebar-drag" /> : null}
-			<div className={`workspace-shell ${tabOrientation === "vertical" ? "with-vertical-tabs" : ""}`}>
-				{tabOrientation === "vertical" && workspaces.length > 0 ? (
-					<aside className="workspace-rail" onDragOver={handleWorkspaceDropDragOver} onDrop={handleWorkspaceDrop}>
-						<div className="workspace-rail-header">
-							<div className="settings-anchor">
+					<div className="topbar-component-row">
+						<div className="topbar-side topbar-side-leading">
+							<button
+								ref={topFileTreeButtonRef}
+								type="button"
+								className={`icon-button file-tree-toggle ${fileTreeOpen ? "active" : ""}`}
+								onClick={toggleFileTree}
+								disabled={!hasActiveWorkspace}
+								aria-label={fileTreeOpen ? "Hide file tree" : "Show file tree"}
+							>
+								<FileTreeToggleIcon />
+							</button>
+						</div>
+						<div className="workspace-switcher-shell">
+							<div className="workspace-switcher">
+								<div ref={workspacePillbarRef} className="workspace-pillbar">{workspaceTabs}</div>
+								<button type="button" className="icon-button workspace-topbar-add" onClick={addWorkspace} aria-label="Open directory">
+									+
+								</button>
+							</div>
+						</div>
+						<div className="topbar-side topbar-side-trailing">
+							<div className="settings-anchor settings-anchor-trailing topbar-trailing-settings">
 								<button
-									ref={railSettingsButtonRef}
+									ref={topSettingsButtonRef}
 									type="button"
 									className={`icon-button ${settingsOpen ? "active" : ""}`}
 									onClick={() => {
@@ -1077,83 +1477,128 @@ export function App() {
 									⚙
 								</button>
 							</div>
-							<span className="rail-label">Workspaces</span>
 						</div>
-						<div className="workspace-rail-body">{workspaceTabs}</div>
-					</aside>
-				) : null}
-				<div className="workspace-stage">
-					<AnimatePresence initial={false} mode="wait">
-						{workspaces.length === 0 ? (
-							<motion.div
-								key="empty"
-								className="empty-state"
-								onDragOver={handleWorkspaceDropDragOver}
-								onDrop={handleWorkspaceDrop}
-								initial={{ opacity: 0, scale: 0.995, y: 4 }}
-								animate={{ opacity: 1, scale: 1, y: 0 }}
-								exit={{ opacity: 0, scale: 0.995, y: -2 }}
-								transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
-							>
-								<div className="empty-state-hero">
-									<h1 className="empty-state-brand">Mosaic</h1>
-									<p className="empty-state-tagline">Open a directory to begin.</p>
-									<button type="button" className="empty-state-cta" onClick={addWorkspace}>
-										Open Directory
+					</div>
+				</header>
+			) : null}
+
+			{tabOrientation === "vertical" ? <div className="titlebar-strip titlebar-drag" /> : null}
+			<div className="workspace-main">
+				<div className={`workspace-shell ${tabOrientation === "vertical" ? "with-vertical-tabs" : ""}`}>
+					{tabOrientation === "vertical" && workspaces.length > 0 ? (
+						<aside className="workspace-rail" onDragOver={handleWorkspaceDropDragOver} onDrop={handleWorkspaceDrop}>
+							<div className="workspace-rail-header">
+								<button
+									ref={railFileTreeButtonRef}
+									type="button"
+									className={`icon-button file-tree-toggle ${fileTreeOpen ? "active" : ""}`}
+									onClick={toggleFileTree}
+									disabled={!hasActiveWorkspace}
+									aria-label={fileTreeOpen ? "Hide file tree" : "Show file tree"}
+								>
+									<FileTreeToggleIcon />
+								</button>
+								<div className="settings-anchor">
+									<button
+										ref={railSettingsButtonRef}
+										type="button"
+										className={`icon-button ${settingsOpen ? "active" : ""}`}
+										onClick={() => {
+											if (settingsOpen) {
+												closeSettings();
+												return;
+											}
+											openSettings();
+										}}
+										aria-label="Open settings"
+									>
+										⚙
 									</button>
 								</div>
-							</motion.div>
-						) : activeWorkspace ? (
-							<motion.div
-								key={activeWorkspace.id}
-								className="workspace-panel"
-								initial={{ opacity: 0, scale: 0.995, y: 2 }}
-								animate={{ opacity: 1, scale: 1, y: 0 }}
-								exit={{ opacity: 0, scale: 0.995, y: -1 }}
-								transition={{ duration: 0.19, ease: [0.22, 1, 0.36, 1] }}
-							>
-								<WorkspaceView
-									workspace={activeWorkspace}
-									accent={activeWorkspaceAccent}
-									theme={currentTheme}
-									focusMode="center"
-									overviewOpen={overviewOpen}
-									onExitOverview={() => setOverviewOpen(false)}
-									onOpenOverview={() => setOverviewOpen(true)}
-									onAddPane={addPaneToActiveWorkspace}
-									focusedPaneId={activeWorkspace.focusedPaneId}
-									onFocusPane={(paneId) => focusPane(activeWorkspace.id, paneId)}
-									onSwapPanes={(sourcePaneId, targetPaneId) =>
-										updateWorkspace(activeWorkspace.id, (workspace) => ({
-											...workspace,
-											layout: swapPanes(workspace.layout, sourcePaneId, targetPaneId),
-											focusedPaneId: sourcePaneId,
-										}))
-									}
-									onSplitPane={(paneId, direction) =>
-										updateWorkspace(activeWorkspace.id, (workspace) => ({
-											...workspace,
-											layout: splitNode(workspace.layout, paneId, direction, workspace.path),
-											focusedPaneId: paneId,
-										}))
-									}
-									onUpdateLayout={(layout) =>
-										updateWorkspace(activeWorkspace.id, (workspace) => ({
-											...workspace,
-											layout,
-											focusedPaneId:
-												workspace.focusedPaneId && findPaneById(layout, workspace.focusedPaneId)
-													? workspace.focusedPaneId
-													: findFirstPaneId(layout),
-										}))
-									}
-								/>
-							</motion.div>
-						) : null}
-					</AnimatePresence>
+								<button type="button" className="icon-button workspace-tab-add" onClick={addWorkspace} aria-label="Open directory">
+									+
+								</button>
+								<span className="rail-label">Workspaces</span>
+							</div>
+							<div className="workspace-rail-body">{workspaceTabs}</div>
+						</aside>
+					) : null}
+					<div className="workspace-stage">
+						<AnimatePresence initial={false} mode="wait">
+							{workspaces.length === 0 ? (
+								<motion.div
+									key="empty"
+									className="empty-state"
+									onDragOver={handleWorkspaceDropDragOver}
+									onDrop={handleWorkspaceDrop}
+									initial={{ opacity: 0, scale: 0.995, y: 4 }}
+									animate={{ opacity: 1, scale: 1, y: 0 }}
+									exit={{ opacity: 0, scale: 0.995, y: -2 }}
+									transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
+								>
+									<div className="empty-state-hero">
+										<h1 className="empty-state-brand">Mosaic</h1>
+										<p className="empty-state-tagline">Open a directory to begin.</p>
+										<button type="button" className="empty-state-cta" onClick={addWorkspace}>
+											Open Directory
+										</button>
+									</div>
+								</motion.div>
+							) : activeWorkspace ? (
+								<motion.div
+									key={activeWorkspace.id}
+									className="workspace-panel"
+									initial={{ opacity: 0, scale: 0.995, y: 2 }}
+									animate={{ opacity: 1, scale: 1, y: 0 }}
+									exit={{ opacity: 0, scale: 0.995, y: -1 }}
+									transition={{ duration: 0.19, ease: [0.22, 1, 0.36, 1] }}
+								>
+									<WorkspaceView
+										workspace={activeWorkspace}
+										accent={activeWorkspaceAccent}
+										theme={currentTheme}
+										focusMode="center"
+										overviewOpen={overviewOpen}
+										onExitOverview={() => setOverviewOpen(false)}
+										onOpenOverview={() => setOverviewOpen(true)}
+										onAddPane={addPaneToActiveWorkspace}
+										onOpenFile={(filePath) => void openFileFromTree(activeWorkspace.id, filePath)}
+										onUpdateTab={(paneId, tabId, updater) => updateWorkspaceTab(activeWorkspace.id, paneId, tabId, updater)}
+										focusedPaneId={activeWorkspace.focusedPaneId}
+										onFocusPane={(paneId) => focusPane(activeWorkspace.id, paneId)}
+										onSwapPanes={(sourcePaneId, targetPaneId) =>
+											updateWorkspace(activeWorkspace.id, (workspace) => ({
+												...workspace,
+												layout: swapPanes(workspace.layout, sourcePaneId, targetPaneId),
+												focusedPaneId: sourcePaneId,
+											}))
+										}
+										onSplitPane={(paneId, direction) =>
+											updateWorkspace(activeWorkspace.id, (workspace) => ({
+												...workspace,
+												layout: splitNode(workspace.layout, paneId, direction, workspace.path),
+												focusedPaneId: paneId,
+											}))
+										}
+										onUpdateLayout={(layout) =>
+											updateWorkspace(activeWorkspace.id, (workspace) => ({
+												...workspace,
+												layout,
+												focusedPaneId:
+													workspace.focusedPaneId && findPaneById(layout, workspace.focusedPaneId)
+														? workspace.focusedPaneId
+														: findFirstPaneId(layout),
+											}))
+										}
+									/>
+								</motion.div>
+							) : null}
+						</AnimatePresence>
+					</div>
 				</div>
 			</div>
 
+			{fileTreePanel}
 			{settingsPanel}
 		</div>
 	);

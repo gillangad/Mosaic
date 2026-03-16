@@ -2,10 +2,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
+import { readdir, readFile, writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import { app, BrowserWindow, dialog, ipcMain, Menu } from "electron";
 import os from "node:os";
 import pty from "node-pty";
+import ignore from "ignore";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -138,6 +140,81 @@ async function inspectWorkspace(directoryPath) {
 	};
 }
 
+const FILE_TREE_EXCLUDED_SEGMENTS = new Set(["node_modules", ".git", "dist"]);
+
+function normalizeRelativePath(value) {
+	return value.replace(/\\/g, "/");
+}
+
+function ensureInsideWorkspace(workspacePath, targetPath) {
+	const resolvedWorkspacePath = path.resolve(workspacePath);
+	const resolvedTargetPath = path.resolve(targetPath);
+	const relative = path.relative(resolvedWorkspacePath, resolvedTargetPath);
+	if (relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))) {
+		return resolvedTargetPath;
+	}
+	throw new Error("Path is outside the workspace root.");
+}
+
+async function buildWorkspaceIgnoreMatcher(workspacePath) {
+	const matcher = ignore();
+	try {
+		const gitignorePath = path.join(workspacePath, ".gitignore");
+		const raw = await readFile(gitignorePath, "utf8");
+		matcher.add(raw);
+	} catch {
+		// No .gitignore found.
+	}
+	return matcher;
+}
+
+function isHardExcluded(relativePath) {
+	const segments = normalizeRelativePath(relativePath).split("/").filter(Boolean);
+	return segments.some((segment) => FILE_TREE_EXCLUDED_SEGMENTS.has(segment));
+}
+
+function isIgnoredPath(matcher, relativePath, isDirectory) {
+	if (!relativePath) return false;
+	if (isHardExcluded(relativePath)) return true;
+	if (!matcher) return false;
+	const normalizedRelativePath = normalizeRelativePath(relativePath);
+	if (matcher.ignores(normalizedRelativePath)) return true;
+	if (isDirectory && matcher.ignores(`${normalizedRelativePath}/`)) return true;
+	return false;
+}
+
+async function listWorkspaceDirectory(workspacePath, directoryPath) {
+	const safeWorkspacePath = path.resolve(workspacePath);
+	const safeDirectoryPath = ensureInsideWorkspace(safeWorkspacePath, directoryPath || safeWorkspacePath);
+	const matcher = await buildWorkspaceIgnoreMatcher(safeWorkspacePath);
+	const entries = await readdir(safeDirectoryPath, { withFileTypes: true });
+
+	const visibleEntries = entries
+		.filter((entry) => {
+			const absolutePath = path.join(safeDirectoryPath, entry.name);
+			const relativePath = normalizeRelativePath(path.relative(safeWorkspacePath, absolutePath));
+			return !isIgnoredPath(matcher, relativePath, entry.isDirectory());
+		})
+		.map((entry) => {
+			const absolutePath = path.join(safeDirectoryPath, entry.name);
+			const relativePath = normalizeRelativePath(path.relative(safeWorkspacePath, absolutePath));
+			const extensionIndex = entry.name.lastIndexOf(".");
+			return {
+				name: entry.name,
+				path: absolutePath,
+				relativePath,
+				isDirectory: entry.isDirectory(),
+				extension: extensionIndex > 0 ? entry.name.slice(extensionIndex + 1).toLowerCase() : "",
+			};
+		})
+		.sort((left, right) => {
+			if (left.isDirectory !== right.isDirectory) return left.isDirectory ? -1 : 1;
+			return left.name.localeCompare(right.name, undefined, { sensitivity: "base" });
+		});
+
+	return visibleEntries;
+}
+
 function createWindow() {
 	const isMac = process.platform === "darwin";
 
@@ -248,6 +325,32 @@ ipcMain.handle("workspace:pickDirectory", async () => {
 });
 
 ipcMain.handle("workspace:inspect", (_event, directoryPath) => inspectWorkspace(directoryPath));
+
+ipcMain.handle("fs:readDir", async (_event, payload) => {
+	if (!payload || typeof payload !== "object") {
+		throw new Error("Invalid directory read payload.");
+	}
+	const workspacePath = typeof payload.workspacePath === "string" ? payload.workspacePath : "";
+	const directoryPath = typeof payload.directoryPath === "string" ? payload.directoryPath : workspacePath;
+	if (!workspacePath) {
+		throw new Error("workspacePath is required.");
+	}
+	return listWorkspaceDirectory(workspacePath, directoryPath);
+});
+
+ipcMain.handle("fs:readFile", async (_event, filePath) => {
+	if (typeof filePath !== "string" || filePath.length === 0) {
+		throw new Error("filePath is required.");
+	}
+	return readFile(filePath, "utf8");
+});
+
+ipcMain.handle("fs:writeFile", async (_event, payload) => {
+	if (!payload || typeof payload !== "object" || typeof payload.filePath !== "string") {
+		throw new Error("Invalid write payload.");
+	}
+	await writeFile(payload.filePath, typeof payload.contents === "string" ? payload.contents : "", "utf8");
+});
 
 ipcMain.handle("window:updateTitleBarOverlay", (event, payload = {}) => {
 	const win = BrowserWindow.fromWebContents(event.sender);
