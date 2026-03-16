@@ -153,15 +153,15 @@ const baseThemes: Record<string, MosaicTheme> = {
 		name: "Default",
 		kind: "dark",
 
-		bgVoid: "#1a1922",
-		bgSurface: "#211f2d",
-		bgWell: "#211f2d",
+		bgVoid: "#0B0B0E",
+		bgSurface: "#0B0B0E",
+		bgWell: "#0B0B0E",
 
-		borderDim: "rgba(180, 170, 220, 0.06)",
-		borderGlow: "rgba(180, 170, 220, 0.14)",
+		borderDim: "rgba(180, 170, 220, 0.08)",
+		borderGlow: "rgba(180, 170, 220, 0.18)",
 
 		textPrimary: "#e6e4ef",
-		textSecondary: "#807c92",
+		textSecondary: "#8d89a2",
 		textMuted: "#4a475a",
 
 		statusSuccess: "#6ed4a0",
@@ -178,9 +178,9 @@ const baseThemes: Record<string, MosaicTheme> = {
 		terminal: {
 			foreground: "#d4d0e4",
 			cursor: "#9580ff",
-			cursorAccent: "#211f2d",
+			cursorAccent: "#0B0B0E",
 			selectionBackground: "rgba(149, 128, 255, 0.12)",
-			black: "#1a1922",
+			black: "#0B0B0E",
 			brightBlack: "#4a475a",
 			red: "#e85a5a",
 			green: "#6ed4a0",

@@ -1,7 +1,7 @@
 import type { TerminalBackend } from "./terminal-backend";
 import { normalizeShellLabel } from "./terminal-utils";
 
-const MAX_SNAPSHOT_CHARS = 500_000;
+const MAX_SNAPSHOT_CHARS = 150_000;
 
 function trimSnapshot(snapshot: string) {
 	if (snapshot.length <= MAX_SNAPSHOT_CHARS) return snapshot;

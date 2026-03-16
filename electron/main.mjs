@@ -2,7 +2,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { readdir, readFile, writeFile } from "node:fs/promises";
+import { readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import { app, BrowserWindow, dialog, ipcMain, Menu } from "electron";
 import os from "node:os";
@@ -14,6 +14,85 @@ const __dirname = path.dirname(__filename);
 const execFileAsync = promisify(execFile);
 
 const sessions = new Map();
+const GIT_COMMAND_TIMEOUT_MS = 4_000;
+const GIT_STATUS_CACHE_TTL_MS = 15_000;
+const gitStatusCache = new Map();
+let defaultWindowsShellCache = null;
+let terminalSpawnEnvCache = null;
+
+function getEmptyGitStatus() {
+	return {
+		isRepo: false,
+		branch: null,
+		summary: "No git repository detected",
+		dirty: false,
+		ahead: 0,
+		behind: 0,
+		changeCount: 0,
+		rootPath: null,
+	};
+}
+
+function parseGitPorcelainStatus(statusStdout) {
+	const lines = statusStdout.split(/\r?\n/).filter(Boolean);
+	const branchLine = lines.find((line) => line.startsWith("# branch.head "));
+	const aheadBehindLine = lines.find((line) => line.startsWith("# branch.ab "));
+	const branchName = branchLine?.replace("# branch.head ", "").trim() || null;
+	const statusLines = lines.filter((line) => !line.startsWith("#"));
+	const files = statusLines.map((line) => {
+		const x = line[0] ?? " ";
+		const y = line[1] ?? " ";
+		const remainder = line.slice(3).trim();
+		const [fromPath, toPath] = remainder.split(" -> ");
+		const pathValue = (toPath || fromPath || "").trim();
+		const statusCode = x !== " " && x !== "?" ? x : y;
+		return {
+			path: pathValue,
+			originalPath: toPath ? fromPath.trim() : null,
+			status: statusCode === "?" ? "U" : statusCode || "M",
+			staged: x !== " " && x !== "?",
+			unstaged: y !== " " && y !== "?",
+			raw: line,
+		};
+	});
+
+	let ahead = 0;
+	let behind = 0;
+	if (aheadBehindLine) {
+		const match = aheadBehindLine.match(/\+(\d+)\s+\-(\d+)/);
+		if (match) {
+			ahead = Number(match[1]);
+			behind = Number(match[2]);
+		}
+	}
+
+	const dirty = files.length > 0;
+	const parts = [branchName && branchName !== "(detached)" ? branchName : "detached"];
+	parts.push(dirty ? `${files.length} change${files.length === 1 ? "" : "s"}` : "clean");
+	if (ahead) parts.push(`+${ahead}`);
+	if (behind) parts.push(`-${behind}`);
+
+	return {
+		branchName,
+		ahead,
+		behind,
+		dirty,
+		summary: parts.join(" • "),
+		files,
+	};
+}
+
+function clearGitStatusCacheFor(directoryPath) {
+	const cacheKey = path.resolve(directoryPath);
+	gitStatusCache.delete(cacheKey);
+}
+
+function normalizeGitDirectoryPath(directoryPath) {
+	if (typeof directoryPath !== "string" || directoryPath.trim().length === 0) {
+		throw new Error("directoryPath is required");
+	}
+	return directoryPath;
+}
 
 function closeTrackedSession(session) {
 	if (!session || session.closed || session.closing) return;
@@ -42,21 +121,19 @@ function normalizeSubscriptionPayload(payload) {
 	};
 }
 
-if (process.platform === "linux") {
-	app.disableHardwareAcceleration();
-}
-
 app.commandLine.appendSwitch("remote-debugging-port", "9222");
 
 function resolveWindowsDefaultShell() {
+	if (defaultWindowsShellCache) return defaultWindowsShellCache;
+
 	const wherePwsh = spawnSync("where.exe", ["pwsh.exe"], {
 		encoding: "utf8",
 		windowsHide: true,
 	});
 	if (wherePwsh.status === 0) {
 		const onPath = wherePwsh.stdout.split(/\r?\n/).find(Boolean)?.trim();
-		if (onPath) return onPath;
-		return "pwsh.exe";
+		defaultWindowsShellCache = onPath || "pwsh.exe";
+		return defaultWindowsShellCache;
 	}
 
 	const candidates = [
@@ -66,10 +143,14 @@ function resolveWindowsDefaultShell() {
 	].filter(Boolean);
 
 	for (const candidate of candidates) {
-		if (existsSync(candidate)) return candidate;
+		if (existsSync(candidate)) {
+			defaultWindowsShellCache = candidate;
+			return defaultWindowsShellCache;
+		}
 	}
 
-	return process.env.ComSpec || "cmd.exe";
+	defaultWindowsShellCache = process.env.ComSpec || "cmd.exe";
+	return defaultWindowsShellCache;
 }
 
 function getDefaultShell() {
@@ -80,69 +161,209 @@ function getDefaultShell() {
 	return process.env.SHELL || "/bin/bash";
 }
 
-async function readWorkspaceGitStatus(directoryPath) {
+function getTerminalSpawnEnv() {
+	if (terminalSpawnEnvCache) return terminalSpawnEnvCache;
+	const localBinPath = path.join(__dirname, "..", "node_modules", ".bin");
+	const basePath = process.env.PATH ?? process.env.Path ?? "";
+	const mergedPath = [localBinPath, basePath].filter(Boolean).join(path.delimiter);
+	terminalSpawnEnvCache = {
+		...process.env,
+		PATH: mergedPath,
+		Path: mergedPath,
+	};
+	return terminalSpawnEnvCache;
+}
+
+function convertWindowsWslUncToLinuxPath(directoryPath) {
+	if (process.platform !== "win32") return null;
+	if (typeof directoryPath !== "string") return null;
+	const match = directoryPath.match(/^\\\\(?:wsl\.localhost|wsl\$)\\([^\\]+)(?:\\(.*))?$/i);
+	if (!match) return null;
+	const distro = match[1];
+	const remainder = match[2] ?? "";
+	const normalizedRemainder = remainder.replace(/\\+/g, "/").replace(/^\/+/, "");
+	const linuxPath = `/${normalizedRemainder}`.replace(/\/+/g, "/");
+	return {
+		distro,
+		linuxPath: linuxPath === "/" ? "/" : linuxPath.replace(/\/$/, "") || "/",
+	};
+}
+
+async function runGit(args, directoryPath) {
+	const wslPath = convertWindowsWslUncToLinuxPath(directoryPath);
+	if (wslPath) {
+		return execFileAsync("wsl.exe", ["--distribution", wslPath.distro, "--cd", wslPath.linuxPath, "git", ...args], {
+			timeout: GIT_COMMAND_TIMEOUT_MS,
+			maxBuffer: 1024 * 1024,
+			windowsHide: true,
+		});
+	}
+
+	return execFileAsync("git", args, {
+		cwd: directoryPath,
+		timeout: GIT_COMMAND_TIMEOUT_MS,
+		maxBuffer: 1024 * 1024,
+		windowsHide: true,
+	});
+}
+
+async function readWorkspaceGitStatus(directoryPath, options = {}) {
+	const cacheKey = path.resolve(directoryPath);
+	const now = Date.now();
+	const cached = gitStatusCache.get(cacheKey);
+	if (!options.force) {
+		if (cached?.value && cached.expiresAt > now) return cached.value;
+		if (cached?.promise) return cached.promise;
+	}
+
+	const promise = (async () => {
+		try {
+			const { stdout: rootStdout } = await runGit(["rev-parse", "--show-toplevel"], directoryPath);
+			const rootPath = rootStdout.trim();
+			const { stdout: statusStdout } = await runGit(["status", "--porcelain=v1", "--branch"], directoryPath);
+			const parsed = parseGitPorcelainStatus(statusStdout);
+			return {
+				isRepo: true,
+				branch: parsed.branchName,
+				summary: parsed.summary,
+				dirty: parsed.dirty,
+				ahead: parsed.ahead,
+				behind: parsed.behind,
+				changeCount: parsed.files.length,
+				rootPath,
+			};
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			console.error(`[git] failed for "${directoryPath}":`, message);
+			return getEmptyGitStatus();
+		}
+	})();
+
+	gitStatusCache.set(cacheKey, {
+		value: cached?.value ?? null,
+		expiresAt: cached?.expiresAt ?? 0,
+		promise,
+	});
+
+	const value = await promise;
+	gitStatusCache.set(cacheKey, {
+		value,
+		expiresAt: Date.now() + GIT_STATUS_CACHE_TTL_MS,
+		promise: null,
+	});
+	return value;
+}
+
+async function readWorkspaceGitDetails(directoryPath, options = {}) {
+	const safeDirectoryPath = normalizeGitDirectoryPath(directoryPath);
 	try {
-		const { stdout: rootStdout } = await execFileAsync("git", ["-C", directoryPath, "rev-parse", "--show-toplevel"]);
+		const { stdout: rootStdout } = await runGit(["rev-parse", "--show-toplevel"], safeDirectoryPath);
 		const rootPath = rootStdout.trim();
-		const { stdout: statusStdout } = await execFileAsync("git", ["-C", directoryPath, "status", "--porcelain=v1", "--branch"]);
-		const lines = statusStdout.split(/\r?\n/).filter(Boolean);
-		const branchLine = lines.find((line) => line.startsWith("# branch.head "));
-		const aheadBehindLine = lines.find((line) => line.startsWith("# branch.ab "));
-		const branchName = branchLine?.replace("# branch.head ", "").trim() || null;
-		const statusLines = lines.filter((line) => !line.startsWith("#"));
-		const dirty = statusLines.length > 0;
-		let ahead = 0;
-		let behind = 0;
-
-		if (aheadBehindLine) {
-			const match = aheadBehindLine.match(/\+(\d+)\s+\-(\d+)/);
-			if (match) {
-				ahead = Number(match[1]);
-				behind = Number(match[2]);
-			}
-		}
-
-		const parts = [branchName && branchName !== "(detached)" ? branchName : "detached"];
-		if (dirty) {
-			parts.push(`${statusLines.length} change${statusLines.length === 1 ? "" : "s"}`);
-		} else {
-			parts.push("clean");
-		}
-		if (ahead) parts.push(`+${ahead}`);
-		if (behind) parts.push(`-${behind}`);
-
-		return {
+		const { stdout: statusStdout } = await runGit(["status", "--porcelain=v1", "--branch"], safeDirectoryPath);
+		const parsed = parseGitPorcelainStatus(statusStdout);
+		const value = {
 			isRepo: true,
-			branch: branchName,
-			summary: parts.join(" • "),
-			dirty,
-			ahead,
-			behind,
-			changeCount: statusLines.length,
+			branch: parsed.branchName,
+			summary: parsed.summary,
+			dirty: parsed.dirty,
+			ahead: parsed.ahead,
+			behind: parsed.behind,
+			changeCount: parsed.files.length,
 			rootPath,
+			files: parsed.files,
 		};
-	} catch {
+		if (options.force) {
+			clearGitStatusCacheFor(safeDirectoryPath);
+		}
+		return value;
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		console.error(`[git] status details failed for "${safeDirectoryPath}":`, message);
 		return {
-			isRepo: false,
-			branch: null,
-			summary: "No git repository detected",
-			dirty: false,
-			ahead: 0,
-			behind: 0,
-			changeCount: 0,
-			rootPath: null,
+			...getEmptyGitStatus(),
+			files: [],
 		};
 	}
 }
 
-async function inspectWorkspace(directoryPath) {
+async function readWorkspaceGitLog(directoryPath, limit = 30) {
+	const safeDirectoryPath = normalizeGitDirectoryPath(directoryPath);
+	const safeLimit = Math.max(1, Math.min(200, Number.isFinite(limit) ? Number(limit) : 30));
+	const { stdout } = await runGit([
+		"log",
+		`-n`,
+		String(safeLimit),
+		"--pretty=format:%H%x1f%h%x1f%an%x1f%ar%x1f%s",
+	], safeDirectoryPath);
+	return stdout
+		.split(/\r?\n/)
+		.filter(Boolean)
+		.map((line) => {
+			const [hash, shortHash, author, relativeTime, subject] = line.split("\u001f");
+			return {
+				hash,
+				shortHash,
+				author,
+				relativeTime,
+				subject,
+			};
+		});
+}
+
+async function readWorkspaceGitBranches(directoryPath) {
+	const safeDirectoryPath = normalizeGitDirectoryPath(directoryPath);
+	const { stdout } = await runGit([
+		"branch",
+		"--format=%(refname:short)%x1f%(HEAD)",
+	], safeDirectoryPath);
+	return stdout
+		.split(/\r?\n/)
+		.filter(Boolean)
+		.map((line) => {
+			const [name, headMarker] = line.split("\u001f");
+			return {
+				name,
+				current: (headMarker || "").trim() === "*",
+			};
+		});
+}
+
+async function readWorkspaceGitStashes(directoryPath) {
+	const safeDirectoryPath = normalizeGitDirectoryPath(directoryPath);
+	const { stdout } = await runGit([
+		"stash",
+		"list",
+		"--pretty=format:%gd%x1f%gs%x1f%cr",
+	], safeDirectoryPath);
+	return stdout
+		.split(/\r?\n/)
+		.filter(Boolean)
+		.map((line) => {
+			const [ref, message, relativeTime] = line.split("\u001f");
+			return {
+				ref,
+				message,
+				relativeTime,
+			};
+		});
+}
+
+async function runWorkspaceGitMutation(directoryPath, args) {
+	const safeDirectoryPath = normalizeGitDirectoryPath(directoryPath);
+	const result = await runGit(args, safeDirectoryPath);
+	clearGitStatusCacheFor(safeDirectoryPath);
+	return result;
+}
+
+async function inspectWorkspace(directoryPath, options = {}) {
 	return {
 		path: directoryPath,
-		git: await readWorkspaceGitStatus(directoryPath),
+		git: await readWorkspaceGitStatus(directoryPath, options),
 	};
 }
 
 const FILE_TREE_EXCLUDED_SEGMENTS = new Set(["node_modules", ".git", "dist"]);
+const workspaceIgnoreMatcherCache = new Map();
 
 function normalizeRelativePath(value) {
 	return value.replace(/\\/g, "/");
@@ -159,15 +380,24 @@ function ensureInsideWorkspace(workspacePath, targetPath) {
 }
 
 async function buildWorkspaceIgnoreMatcher(workspacePath) {
-	const matcher = ignore();
-	try {
-		const gitignorePath = path.join(workspacePath, ".gitignore");
-		const raw = await readFile(gitignorePath, "utf8");
-		matcher.add(raw);
-	} catch {
-		// No .gitignore found.
-	}
-	return matcher;
+	const cacheKey = path.resolve(workspacePath);
+	const cached = workspaceIgnoreMatcherCache.get(cacheKey);
+	if (cached) return cached;
+
+	const matcherPromise = (async () => {
+		const matcher = ignore();
+		try {
+			const gitignorePath = path.join(workspacePath, ".gitignore");
+			const raw = await readFile(gitignorePath, "utf8");
+			matcher.add(raw);
+		} catch {
+			// No .gitignore found.
+		}
+		return matcher;
+	})();
+
+	workspaceIgnoreMatcherCache.set(cacheKey, matcherPromise);
+	return matcherPromise;
 }
 
 function isHardExcluded(relativePath) {
@@ -175,10 +405,13 @@ function isHardExcluded(relativePath) {
 	return segments.some((segment) => FILE_TREE_EXCLUDED_SEGMENTS.has(segment));
 }
 
-function isIgnoredPath(_matcher, relativePath, _isDirectory) {
+function isIgnoredPath(matcher, relativePath, isDirectory) {
 	if (!relativePath) return false;
 	if (isHardExcluded(relativePath)) return true;
-	return false;
+	if (!matcher) return false;
+	const normalizedPath = normalizeRelativePath(relativePath);
+	if (matcher.ignores(normalizedPath)) return true;
+	return isDirectory ? matcher.ignores(`${normalizedPath}/`) : false;
 }
 
 async function listWorkspaceDirectory(workspacePath, directoryPath) {
@@ -327,16 +560,9 @@ function createPtySession(options = {}) {
 	const shell = getDefaultShell();
 	const cwd = options.cwd || os.homedir();
 
-	const localBinPath = path.join(__dirname, "..", "node_modules", ".bin");
-	const basePath = process.env.PATH ?? process.env.Path ?? "";
-	const mergedPath = [localBinPath, basePath].filter(Boolean).join(path.delimiter);
 	const spawnOptions = {
 		name: "xterm-256color",
-		env: {
-			...process.env,
-			PATH: mergedPath,
-			Path: mergedPath,
-		},
+		env: getTerminalSpawnEnv(),
 		cols: 120,
 		rows: 36,
 	};
@@ -396,6 +622,90 @@ ipcMain.handle("workspace:pickDirectory", async () => {
 });
 
 ipcMain.handle("workspace:inspect", (_event, directoryPath) => inspectWorkspace(directoryPath));
+ipcMain.handle("git:status", async (_event, payload) => {
+	const directoryPath = typeof payload?.directoryPath === "string" ? payload.directoryPath : payload;
+	const force = Boolean(payload?.force);
+	return readWorkspaceGitDetails(directoryPath, { force });
+});
+ipcMain.handle("git:branches", async (_event, directoryPath) => readWorkspaceGitBranches(directoryPath));
+ipcMain.handle("git:log", async (_event, payload) => {
+	const directoryPath = typeof payload?.directoryPath === "string" ? payload.directoryPath : payload;
+	const limit = Number(payload?.limit ?? 30);
+	return readWorkspaceGitLog(directoryPath, limit);
+});
+ipcMain.handle("git:diff", async (_event, payload) => {
+	const directoryPath = normalizeGitDirectoryPath(payload?.directoryPath);
+	const filePath = typeof payload?.filePath === "string" ? payload.filePath : "";
+	const cached = Boolean(payload?.cached);
+	if (!filePath) throw new Error("filePath is required");
+	const args = cached ? ["diff", "--cached", "--", filePath] : ["diff", "--", filePath];
+	const { stdout } = await runGit(args, directoryPath);
+	return stdout;
+});
+ipcMain.handle("git:showCommit", async (_event, payload) => {
+	const directoryPath = normalizeGitDirectoryPath(payload?.directoryPath);
+	const hash = typeof payload?.hash === "string" ? payload.hash : "";
+	if (!hash) throw new Error("hash is required");
+	const { stdout } = await runGit(["show", "--format=", "--no-color", hash], directoryPath);
+	return stdout;
+});
+ipcMain.handle("git:stage", async (_event, payload) => {
+	const directoryPath = normalizeGitDirectoryPath(payload?.directoryPath);
+	const filePath = typeof payload?.filePath === "string" ? payload.filePath : "";
+	if (!filePath) throw new Error("filePath is required");
+	await runWorkspaceGitMutation(directoryPath, ["add", "--", filePath]);
+	return readWorkspaceGitDetails(directoryPath, { force: true });
+});
+ipcMain.handle("git:unstage", async (_event, payload) => {
+	const directoryPath = normalizeGitDirectoryPath(payload?.directoryPath);
+	const filePath = typeof payload?.filePath === "string" ? payload.filePath : "";
+	if (!filePath) throw new Error("filePath is required");
+	await runWorkspaceGitMutation(directoryPath, ["reset", "HEAD", "--", filePath]);
+	return readWorkspaceGitDetails(directoryPath, { force: true });
+});
+ipcMain.handle("git:checkout", async (_event, payload) => {
+	const directoryPath = normalizeGitDirectoryPath(payload?.directoryPath);
+	const branch = typeof payload?.branch === "string" ? payload.branch.trim() : "";
+	if (!branch) throw new Error("branch is required");
+	await runWorkspaceGitMutation(directoryPath, ["checkout", branch]);
+	return readWorkspaceGitDetails(directoryPath, { force: true });
+});
+ipcMain.handle("git:commit", async (_event, payload) => {
+	const directoryPath = normalizeGitDirectoryPath(payload?.directoryPath);
+	const message = typeof payload?.message === "string" ? payload.message.trim() : "";
+	const amend = Boolean(payload?.amend);
+	if (!message && !amend) throw new Error("commit message is required");
+	if (amend) {
+		const args = message ? ["commit", "--amend", "-m", message] : ["commit", "--amend", "--no-edit"];
+		await runWorkspaceGitMutation(directoryPath, args);
+	} else {
+		await runWorkspaceGitMutation(directoryPath, ["commit", "-m", message]);
+	}
+	return readWorkspaceGitDetails(directoryPath, { force: true });
+});
+ipcMain.handle("git:push", async (_event, directoryPath) => {
+	await runWorkspaceGitMutation(directoryPath, ["push"]);
+	return readWorkspaceGitDetails(directoryPath, { force: true });
+});
+ipcMain.handle("git:pull", async (_event, directoryPath) => {
+	await runWorkspaceGitMutation(directoryPath, ["pull", "--ff-only"]);
+	return readWorkspaceGitDetails(directoryPath, { force: true });
+});
+ipcMain.handle("git:stashList", async (_event, directoryPath) => readWorkspaceGitStashes(directoryPath));
+ipcMain.handle("git:stashApply", async (_event, payload) => {
+	const directoryPath = normalizeGitDirectoryPath(payload?.directoryPath);
+	const ref = typeof payload?.ref === "string" ? payload.ref : "";
+	if (!ref) throw new Error("stash ref is required");
+	await runWorkspaceGitMutation(directoryPath, ["stash", "apply", ref]);
+	return readWorkspaceGitStashes(directoryPath);
+});
+ipcMain.handle("git:stashDrop", async (_event, payload) => {
+	const directoryPath = normalizeGitDirectoryPath(payload?.directoryPath);
+	const ref = typeof payload?.ref === "string" ? payload.ref : "";
+	if (!ref) throw new Error("stash ref is required");
+	await runWorkspaceGitMutation(directoryPath, ["stash", "drop", ref]);
+	return readWorkspaceGitStashes(directoryPath);
+});
 
 ipcMain.handle("fs:readDir", async (_event, payload) => {
 	if (!payload || typeof payload !== "object") {
@@ -416,12 +726,15 @@ ipcMain.handle("fs:readFile", async (_event, filePath) => {
 	return readFile(filePath, "utf8");
 });
 
-ipcMain.handle("fs:readFileBase64", async (_event, filePath) => {
+ipcMain.handle("fs:getFileInfo", async (_event, filePath) => {
 	if (typeof filePath !== "string" || filePath.length === 0) {
 		throw new Error("filePath is required.");
 	}
-	const buffer = await readFile(filePath);
-	return buffer.toString("base64");
+	const fileStats = await stat(filePath);
+	return {
+		size: fileStats.size,
+		mtimeMs: fileStats.mtimeMs,
+	};
 });
 
 ipcMain.handle("fs:writeFile", async (_event, payload) => {
@@ -454,8 +767,8 @@ ipcMain.handle("window:updateTitleBarOverlay", (event, payload = {}) => {
 	}
 });
 
-ipcMain.handle("terminal:write", (_event, payload) => {
-	const session = sessions.get(payload.id);
+ipcMain.on("terminal:write", (_event, payload) => {
+	const session = sessions.get(payload?.id);
 	if (!session || session.closed) return;
 	try {
 		session.proc.write(payload.data);

@@ -76,7 +76,7 @@ describe("layout resizing invariants", () => {
 		expect(after.second).toBeGreaterThan(before.second);
 	});
 
-	it("resizeVerticalSplitByDelta caps a branch at 100 width units", () => {
+	it("resizeVerticalSplitByDelta allows branch growth past 100 width units", () => {
 		const layout = appendPaneToRight(createPaneNode(WORKSPACE_PATH), WORKSPACE_PATH);
 		expect(layout.type).toBe("split");
 		if (layout.type !== "split" || layout.direction !== "vertical") return;
@@ -87,7 +87,7 @@ describe("layout resizing invariants", () => {
 		if (!split || split.direction !== "vertical") return;
 
 		const after = getVerticalBranchWidths(split);
-		expect(after.first).toBeCloseTo(100, 6);
+		expect(after.first).toBeGreaterThan(100);
 		expect(after.second).toBeCloseTo(50, 6);
 	});
 
@@ -107,7 +107,7 @@ describe("layout resizing invariants", () => {
 		expect(after.first).toBeCloseTo(60, 6);
 	});
 
-	it("updateSplitRatio does not grow first branch past 100 width units", () => {
+	it("updateSplitRatio allows first branch to grow past 100 width units", () => {
 		const layout = appendPaneToRight(createPaneNode(WORKSPACE_PATH), WORKSPACE_PATH);
 		expect(layout.type).toBe("split");
 		if (layout.type !== "split" || layout.direction !== "vertical") return;
@@ -118,11 +118,11 @@ describe("layout resizing invariants", () => {
 		if (!split || split.direction !== "vertical") return;
 
 		const after = getVerticalBranchWidths(split);
-		expect(after.first).toBeCloseTo(100, 6);
-		expect(after.second).toBeCloseTo(50, 6);
+		expect(after.first).toBeGreaterThan(100);
+		expect(after.second).toBeGreaterThan(0);
 	});
 
-	it("enforcePaneWidthCap shrinks oversized pane widths to 100", () => {
+	it("enforcePaneWidthCap keeps pane widths below the expanded cap", () => {
 		const oversized = createPaneNode(WORKSPACE_PATH);
 		const layout: LayoutNode = {
 			...oversized,
@@ -132,6 +132,6 @@ describe("layout resizing invariants", () => {
 		const normalized = enforcePaneWidthCap(layout);
 		expect(normalized.type).toBe("pane");
 		if (normalized.type !== "pane") return;
-		expect(normalized.widthUnits).toBeCloseTo(100, 6);
+		expect(normalized.widthUnits).toBeCloseTo(182, 6);
 	});
 });

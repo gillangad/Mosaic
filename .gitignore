@@ -23,6 +23,41 @@ npm-debug.log*
 .env
 .env.*
 
-# Internal docs — ignore all .md except README
+# Secrets / credentials
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*.der
+*.jks
+*.keystore
+*.kdbx
+*.ovpn
+*.mobileconfig
+*.secret
+*.secrets
+*.token
+*.tokens
+*.credentials
+*.creds
+*.password
+*.passwords
+*.private
+*.age
+.ssh/
+.npmrc
+.aws/
+.azure/
+.gcp/
+.direnv/
+.envrc
+*.tfstate
+*.tfstate.*
+terraform.tfvars
+terraform.tfvars.json
+
+# Internal docs — ignore all markdown except README
 *.md
 !README.md

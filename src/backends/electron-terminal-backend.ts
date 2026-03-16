@@ -19,7 +19,7 @@ class ElectronTerminalBackend implements TerminalBackend {
 
 	async write(sessionId: string, data: string) {
 		if (!this.isAvailable()) return;
-		await window.mosaic.writeTerminal(sessionId, data);
+		window.mosaic.writeTerminal(sessionId, data);
 	}
 
 	async resize(sessionId: string, cols: number, rows: number) {

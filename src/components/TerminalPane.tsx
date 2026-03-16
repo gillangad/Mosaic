@@ -1,4 +1,6 @@
 import {
+	Suspense,
+	lazy,
 	useCallback,
 	useEffect,
 	useMemo,
@@ -7,7 +9,6 @@ import {
 	type DragEvent as ReactDragEvent,
 	type MouseEvent as ReactMouseEvent,
 } from "react";
-import MonacoEditor from "@monaco-editor/react";
 import "react-pdf/dist/Page/AnnotationLayer.css";
 import "react-pdf/dist/Page/TextLayer.css";
 import { Terminal } from "xterm";
@@ -15,6 +16,7 @@ import { FitAddon } from "xterm-addon-fit";
 import { SearchAddon } from "xterm-addon-search";
 import { SerializeAddon } from "xterm-addon-serialize";
 import { WebLinksAddon } from "xterm-addon-web-links";
+
 import { useSessionManager, useTerminalBackend } from "../core/terminal-backend-context";
 import type { BrowserTabModel, EditorTabModel, FileTreeTabModel, ImageTabModel, PaneModel, PaneTabModel, PdfTabModel, TerminalTabModel } from "../core/models";
 import { BrowserPane } from "./BrowserPane";
@@ -67,7 +69,7 @@ interface FileTreeEntry {
 
 function buildTerminalTheme(theme: MosaicTheme, accent: string) {
 	return {
-		background: "#00000000",
+		background: theme.bgWell,
 		foreground: theme.terminal.foreground,
 		cursor: accent,
 		cursorAccent: theme.terminal.cursorAccent,
@@ -87,6 +89,7 @@ function buildTerminalTheme(theme: MosaicTheme, accent: string) {
 
 const PANE_TAB_DND_TYPE = "application/x-mosaic-pane-tab";
 const PDF_WORKER_SRC = new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url).toString();
+const MonacoEditor = lazy(() => import("@monaco-editor/react"));
 
 function parseDraggedTab(event: Pick<DragEvent, "dataTransfer">) {
 	const payload = event.dataTransfer?.getData(PANE_TAB_DND_TYPE);
@@ -116,39 +119,6 @@ function resolvePaneDropPosition(rect: DOMRect, clientX: number, clientY: number
 	].sort((a, b) => a.value - b.value);
 
 	return distances[0].position;
-}
-
-function normalizeSeparators(value: string) {
-	return value.replace(/\\/g, "/");
-}
-
-function getFileExtension(filePath: string) {
-	const normalized = normalizeSeparators(filePath);
-	const leaf = normalized.split("/").at(-1) ?? normalized;
-	const dotIndex = leaf.lastIndexOf(".");
-	if (dotIndex <= 0 || dotIndex === leaf.length - 1) return "";
-	return leaf.slice(dotIndex + 1).toLowerCase();
-}
-
-function getMimeTypeForImage(filePath: string) {
-	const extension = getFileExtension(filePath);
-	if (extension === "jpg" || extension === "jpeg") return "image/jpeg";
-	if (extension === "png") return "image/png";
-	if (extension === "gif") return "image/gif";
-	if (extension === "svg") return "image/svg+xml";
-	if (extension === "webp") return "image/webp";
-	if (extension === "bmp") return "image/bmp";
-	if (extension === "ico") return "image/x-icon";
-	return "application/octet-stream";
-}
-
-function base64ToUint8Array(base64: string) {
-	const binary = window.atob(base64);
-	const bytes = new Uint8Array(binary.length);
-	for (let index = 0; index < binary.length; index += 1) {
-		bytes[index] = binary.charCodeAt(index);
-	}
-	return bytes;
 }
 
 function FileTypeIcon({ entry }: { entry: FileTreeEntry }) {
@@ -197,11 +167,13 @@ function TerminalTabSurface({ tab, accent, theme, cwd, isActive, onUpdateTabMeta
 	const searchAddonRef = useRef<SearchAddon | null>(null);
 	const serializeAddonRef = useRef<SerializeAddon | null>(null);
 	const sessionRef = useRef<string | null>(null);
-	const idleTimerRef = useRef<number | null>(null);
 	const unsubscribeRef = useRef<(() => void) | null>(null);
 	const resizeObserverRef = useRef<ResizeObserver | null>(null);
+	const resizeFrameRef = useRef<number | null>(null);
+	const lastResizeRef = useRef({ cols: 0, rows: 0 });
 	const updateTabMetaRef = useRef(onUpdateTabMeta);
 	const searchInputRef = useRef<HTMLInputElement | null>(null);
+	const searchDebounceTimerRef = useRef<number | null>(null);
 	const [searchOpen, setSearchOpen] = useState(false);
 	const [searchQuery, setSearchQuery] = useState("");
 	const [searchMatchState, setSearchMatchState] = useState({ current: 0, total: 0 });
@@ -236,7 +208,7 @@ function TerminalTabSurface({ tab, accent, theme, cwd, isActive, onUpdateTabMeta
 				fontSize: 12,
 				lineHeight: 1.18,
 				cursorBlink: true,
-				allowTransparency: true,
+				allowTransparency: false,
 				allowProposedApi: true,
 				theme: buildTerminalTheme(theme, accent),
 			});
@@ -274,12 +246,6 @@ function TerminalTabSurface({ tab, accent, theme, cwd, isActive, onUpdateTabMeta
 
 		let disposed = false;
 
-		const markBusy = () => {
-			updateTabMetaRef.current({ status: "busy" });
-			if (idleTimerRef.current) window.clearTimeout(idleTimerRef.current);
-			idleTimerRef.current = window.setTimeout(() => updateTabMetaRef.current({ status: "idle" }), 900);
-		};
-
 		sessionManager
 			.ensureSession(tab.id, cwd)
 			.then((sessionId) => {
@@ -293,9 +259,18 @@ function TerminalTabSurface({ tab, accent, theme, cwd, isActive, onUpdateTabMeta
 				});
 
 				const resizeTerminal = () => {
-					if (!fitAddonRef.current || !sessionRef.current) return;
-					fitAddonRef.current.fit();
-					void backend.resize(sessionRef.current, terminal.cols, terminal.rows);
+					if (resizeFrameRef.current !== null) return;
+					resizeFrameRef.current = window.requestAnimationFrame(() => {
+						resizeFrameRef.current = null;
+						if (!fitAddonRef.current || !sessionRef.current) return;
+						fitAddonRef.current.fit();
+						const nextCols = terminal.cols;
+						const nextRows = terminal.rows;
+						if (nextCols <= 0 || nextRows <= 0) return;
+						if (nextCols === lastResizeRef.current.cols && nextRows === lastResizeRef.current.rows) return;
+						lastResizeRef.current = { cols: nextCols, rows: nextRows };
+						void backend.resize(sessionRef.current, nextCols, nextRows);
+					});
 				};
 
 				resizeTerminal();
@@ -303,7 +278,6 @@ function TerminalTabSurface({ tab, accent, theme, cwd, isActive, onUpdateTabMeta
 				unsubscribeRef.current = backend.subscribe(sessionId, {
 					onData: (data) => {
 						terminal.write(data);
-						markBusy();
 					},
 					onExit: () => {
 						updateTabMetaRef.current({ status: "exited", message: "Process exited" });
@@ -316,7 +290,6 @@ function TerminalTabSurface({ tab, accent, theme, cwd, isActive, onUpdateTabMeta
 
 				inputDisposable = terminal.onData((data) => {
 					if (!sessionRef.current) return;
-					markBusy();
 					void backend.write(sessionRef.current, data);
 				});
 
@@ -330,7 +303,7 @@ function TerminalTabSurface({ tab, accent, theme, cwd, isActive, onUpdateTabMeta
 				snapshotIntervalId = window.setInterval(() => {
 					if (!serializeAddonRef.current) return;
 					sessionManager.setSnapshot(tab.id, serializeAddonRef.current.serialize());
-				}, 1200);
+				}, 15000);
 			})
 			.catch((error: unknown) => {
 				updateTabMetaRef.current({
@@ -342,8 +315,15 @@ function TerminalTabSurface({ tab, accent, theme, cwd, isActive, onUpdateTabMeta
 
 		return () => {
 			disposed = true;
-			if (idleTimerRef.current) window.clearTimeout(idleTimerRef.current);
+			if (searchDebounceTimerRef.current) {
+				window.clearTimeout(searchDebounceTimerRef.current);
+				searchDebounceTimerRef.current = null;
+			}
 			if (snapshotIntervalId) window.clearInterval(snapshotIntervalId);
+			if (resizeFrameRef.current !== null) {
+				window.cancelAnimationFrame(resizeFrameRef.current);
+				resizeFrameRef.current = null;
+			}
 			resizeObserverRef.current?.disconnect();
 			resizeObserverRef.current = null;
 			unsubscribeRef.current?.();
@@ -457,6 +437,10 @@ function TerminalTabSurface({ tab, accent, theme, cwd, isActive, onUpdateTabMeta
 	}, []);
 
 	const closeSearch = useCallback(() => {
+		if (searchDebounceTimerRef.current) {
+			window.clearTimeout(searchDebounceTimerRef.current);
+			searchDebounceTimerRef.current = null;
+		}
 		setSearchOpen(false);
 		setSearchQuery("");
 		setSearchMatchState({ current: 0, total: 0 });
@@ -466,7 +450,11 @@ function TerminalTabSurface({ tab, accent, theme, cwd, isActive, onUpdateTabMeta
 
 	const handleSearchChange = useCallback((value: string) => {
 		setSearchQuery(value);
-		runSearch(value);
+		if (searchDebounceTimerRef.current) window.clearTimeout(searchDebounceTimerRef.current);
+		searchDebounceTimerRef.current = window.setTimeout(() => {
+			searchDebounceTimerRef.current = null;
+			runSearch(value);
+		}, 120);
 	}, [runSearch]);
 
 	const handleSearchNext = useCallback(() => {
@@ -498,7 +486,7 @@ function TerminalTabSurface({ tab, accent, theme, cwd, isActive, onUpdateTabMeta
 
 	return (
 		<div
-			className={`pane-tab-surface ${isActive ? "active" : ""}`}
+			className={`pane-tab-surface ${isActive ? "active" : "inactive"}`}
 			onKeyDownCapture={(event) => {
 				if (!isActive) return;
 				if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === "f") {
@@ -554,7 +542,7 @@ function TerminalTabSurface({ tab, accent, theme, cwd, isActive, onUpdateTabMeta
 	);
 }
 
-function FileTreeTabSurface({ tab, onOpenFile }: { tab: FileTreeTabModel; onOpenFile: (filePath: string) => void }) {
+function FileTreeTabSurface({ tab, onOpenFile, isActive }: { tab: FileTreeTabModel; onOpenFile: (filePath: string) => void; isActive: boolean }) {
 	const [entriesByPath, setEntriesByPath] = useState<Record<string, FileTreeEntry[]>>({});
 	const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set([tab.rootPath]));
 	const [loadingPaths, setLoadingPaths] = useState<Set<string>>(new Set());
@@ -701,7 +689,7 @@ function FileTreeTabSurface({ tab, onOpenFile }: { tab: FileTreeTabModel; onOpen
 	);
 
 	return (
-		<div className="pane-tab-surface active">
+		<div className={`pane-tab-surface ${isActive ? "active" : "inactive"}`}>
 			<div className="file-tree-surface">
 				<div className="file-tree-toolbar">
 					<div className="file-tree-search">
@@ -749,49 +737,82 @@ function EditorTabSurface({
 	tab,
 	theme,
 	onUpdateTab,
+	isActive,
 }: {
 	tab: EditorTabModel;
 	theme: MosaicTheme;
 	onUpdateTab: (tabId: string, updater: (tab: PaneTabModel) => PaneTabModel) => void;
+	isActive: boolean;
 }) {
 	const contentRef = useRef(tab.content);
-	const [saveMessage, setSaveMessage] = useState(tab.message ?? "");
+	const savedContentRef = useRef(tab.savedContent);
+	const dirtyRef = useRef(tab.dirty);
+	const persistTimerRef = useRef<number | null>(null);
+	const [draftContent, setDraftContent] = useState(tab.content);
+	const [isDirty, setIsDirty] = useState(tab.dirty);
+	const [saveMessage, setSaveMessage] = useState("");
 	const saveMessageTimerRef = useRef<number | null>(null);
 
-	useEffect(() => {
-		contentRef.current = tab.content;
-	}, [tab.content]);
-
-	useEffect(() => {
-		setSaveMessage(tab.message ?? "");
-	}, [tab.message]);
-
-	useEffect(() => {
-		return () => {
-			if (saveMessageTimerRef.current) {
-				window.clearTimeout(saveMessageTimerRef.current);
-			}
-		};
-	}, []);
-
-	const setMessage = useCallback(
-		(message: string) => {
-			setSaveMessage(message);
-			onUpdateTab(tab.id, (current) => (current.kind === "editor" ? { ...current, message } : current));
-			if (saveMessageTimerRef.current) window.clearTimeout(saveMessageTimerRef.current);
-			saveMessageTimerRef.current = window.setTimeout(() => {
-				onUpdateTab(tab.id, (current) => (current.kind === "editor" ? { ...current, message: undefined } : current));
-				setSaveMessage("");
-			}, 2200);
+	const persistDraft = useCallback(
+		(nextContent: string) => {
+			onUpdateTab(tab.id, (current) => {
+				if (current.kind !== "editor") return current;
+				const nextDirty = nextContent !== current.savedContent;
+				if (current.content === nextContent && current.dirty === nextDirty) return current;
+				return {
+					...current,
+					content: nextContent,
+					dirty: nextDirty,
+				};
+			});
 		},
 		[onUpdateTab, tab.id],
 	);
 
+	const flushDraft = useCallback(() => {
+		if (persistTimerRef.current) {
+			window.clearTimeout(persistTimerRef.current);
+			persistTimerRef.current = null;
+		}
+		persistDraft(contentRef.current);
+	}, [persistDraft]);
+
+	useEffect(() => {
+		savedContentRef.current = tab.savedContent;
+		if (persistTimerRef.current) return;
+		if (tab.content === contentRef.current && tab.dirty === dirtyRef.current) return;
+		contentRef.current = tab.content;
+		dirtyRef.current = tab.dirty;
+		setDraftContent(tab.content);
+		setIsDirty(tab.dirty);
+	}, [tab.content, tab.dirty, tab.savedContent]);
+
+	useEffect(() => {
+		return () => {
+			flushDraft();
+			if (saveMessageTimerRef.current) {
+				window.clearTimeout(saveMessageTimerRef.current);
+			}
+		};
+	}, [flushDraft]);
+
+	const setMessage = useCallback((message: string) => {
+		setSaveMessage(message);
+		if (saveMessageTimerRef.current) window.clearTimeout(saveMessageTimerRef.current);
+		saveMessageTimerRef.current = window.setTimeout(() => {
+			setSaveMessage("");
+		}, 2200);
+	}, []);
+
 	const saveFile = useCallback(async () => {
 		if (typeof window === "undefined" || typeof window.mosaic === "undefined") return;
+		flushDraft();
 		const nextContent = contentRef.current;
 		try {
 			await window.mosaic.writeFile(tab.filePath, nextContent);
+			savedContentRef.current = nextContent;
+			dirtyRef.current = false;
+			setIsDirty(false);
 			onUpdateTab(tab.id, (current) => {
 				if (current.kind !== "editor") return current;
 				return {
@@ -805,50 +826,53 @@ function EditorTabSurface({
 		} catch (error) {
 			setMessage(error instanceof Error ? error.message : "Save failed");
 		}
-	}, [onUpdateTab, setMessage, tab.filePath, tab.id]);
+	}, [flushDraft, onUpdateTab, setMessage, tab.filePath, tab.id]);
 
 	return (
-		<div className="pane-tab-surface active">
+		<div className={`pane-tab-surface ${isActive ? "active" : "inactive"}`}>
 			<div className="editor-surface">
 				<div className="editor-meta-row">
 					<span className="editor-path" title={tab.filePath}>{tab.filePath}</span>
 					<span className="editor-language-pill">{tab.language}</span>
-					<button type="button" className="editor-save-button" onClick={() => void saveFile()} disabled={!tab.dirty}>
+					<button type="button" className="editor-save-button" onClick={() => void saveFile()} disabled={!isDirty}>
 						Save
 					</button>
 				</div>
-				<MonacoEditor
-					height="100%"
-					language={tab.language}
-					value={tab.content}
-					theme={theme.kind === "light" ? "vs" : "vs-dark"}
-					onChange={(value) => {
-						const nextContent = value ?? "";
-						contentRef.current = nextContent;
-						onUpdateTab(tab.id, (current) => {
-							if (current.kind !== "editor") return current;
-							return {
-								...current,
-								content: nextContent,
-								dirty: nextContent !== current.savedContent,
-							};
-						});
-					}}
-					onMount={(editor, monaco) => {
-						editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
-							void saveFile();
-						});
-					}}
-					options={{
-						minimap: { enabled: true },
-						automaticLayout: true,
-						fontFamily: '"JetBrains Mono", "SF Mono", monospace',
-						fontSize: 13,
-						scrollBeyondLastLine: false,
-						wordWrap: "on",
-						quickSuggestions: true,
-					}}
-				/>
+				<Suspense fallback={<div className="pdf-loading">Loading editor…</div>}>
+					<MonacoEditor
+						height="100%"
+						language={tab.language}
+						value={draftContent}
+						theme={theme.kind === "light" ? "vs" : "vs-dark"}
+						onChange={(value) => {
+							const nextContent = value ?? "";
+							contentRef.current = nextContent;
+							const nextDirty = nextContent !== savedContentRef.current;
+							dirtyRef.current = nextDirty;
+							setDraftContent(nextContent);
+							setIsDirty(nextDirty);
+							if (persistTimerRef.current) window.clearTimeout(persistTimerRef.current);
+							persistTimerRef.current = window.setTimeout(() => {
+								persistTimerRef.current = null;
+								persistDraft(nextContent);
+							}, 300);
+						}}
+						onMount={(editor, monaco) => {
+							editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
+								void saveFile();
+							});
+						}}
+						options={{
+							minimap: { enabled: true },
+							automaticLayout: true,
+							fontFamily: '"JetBrains Mono", "SF Mono", monospace',
+							fontSize: 13,
+							scrollBeyondLastLine: false,
+							wordWrap: "on",
+							quickSuggestions: true,
+						}}
+					/>
+				</Suspense>
 				{saveMessage ? <div className="editor-save-message">{saveMessage}</div> : null}
 			</div>
 		</div>
@@ -858,14 +882,20 @@ function EditorTabSurface({
 function MarkdownTabSurface({
 	tab,
 	onUpdateTab,
+	isActive,
 }: {
 	tab: Extract<PaneTabModel, { kind: "markdown" }>;
 	onUpdateTab: (tabId: string, updater: (tab: PaneTabModel) => PaneTabModel) => void;
+	isActive: boolean;
 }) {
 	const editorRootRef = useRef<HTMLDivElement | null>(null);
 	const editorRef = useRef<{ destroy: () => Promise<unknown> } | null>(null);
 	const onUpdateTabRef = useRef(onUpdateTab);
 	const markdownContentRef = useRef(tab.content);
+	const savedContentRef = useRef(tab.savedContent);
+	const markdownDirtyRef = useRef(tab.dirty);
+	const persistTimerRef = useRef<number | null>(null);
+	const [isDirty, setIsDirty] = useState(tab.dirty);
 	const [saveMessage, setSaveMessage] = useState<string | null>(null);
 	const [initError, setInitError] = useState<string | null>(null);
 
@@ -873,31 +903,59 @@ function MarkdownTabSurface({
 		onUpdateTabRef.current = onUpdateTab;
 	}, [onUpdateTab]);
 
+	const persistMarkdownDraft = useCallback((nextContent: string) => {
+		onUpdateTabRef.current(tab.id, (current) => {
+			if (current.kind !== "markdown") return current;
+			const nextDirty = nextContent !== current.savedContent;
+			if (current.content === nextContent && current.dirty === nextDirty) return current;
+			return {
+				...current,
+				content: nextContent,
+				dirty: nextDirty,
+			};
+		});
+	}, [tab.id]);
+
+	const flushMarkdownDraft = useCallback(() => {
+		if (persistTimerRef.current) {
+			window.clearTimeout(persistTimerRef.current);
+			persistTimerRef.current = null;
+		}
+		persistMarkdownDraft(markdownContentRef.current);
+	}, [persistMarkdownDraft]);
+
 	useEffect(() => {
+		savedContentRef.current = tab.savedContent;
+		if (persistTimerRef.current) return;
+		if (tab.content === markdownContentRef.current && tab.dirty === markdownDirtyRef.current) return;
 		markdownContentRef.current = tab.content;
-	}, [tab.content]);
+		markdownDirtyRef.current = tab.dirty;
+		setIsDirty(tab.dirty);
+	}, [tab.content, tab.dirty, tab.savedContent]);
 
 	const saveMarkdown = useCallback(async () => {
 		if (typeof window === "undefined" || typeof window.mosaic === "undefined") return;
+		flushMarkdownDraft();
 		try {
 			const nextContent = markdownContentRef.current;
 			await window.mosaic.writeFile(tab.filePath, nextContent);
+			savedContentRef.current = nextContent;
+			markdownDirtyRef.current = false;
+			setIsDirty(false);
 			onUpdateTabRef.current(tab.id, (current) => {
 				if (current.kind !== "markdown") return current;
 				return {
 					...current,
-					savedContent: current.content,
+					content: nextContent,
+					savedContent: nextContent,
 					dirty: false,
-					message: "Saved",
 				};
 			});
 			setSaveMessage(`Saved ${new Date().toLocaleTimeString()}`);
 		} catch (error) {
-			const message = error instanceof Error ? error.message : "Failed to save file.";
-			onUpdateTabRef.current(tab.id, (current) => (current.kind === "markdown" ? { ...current, message } : current));
-			setSaveMessage(message);
+			setSaveMessage(error instanceof Error ? error.message : "Failed to save file.");
 		}
-	}, [tab.filePath, tab.id]);
+	}, [flushMarkdownDraft, tab.filePath, tab.id]);
 
 	useEffect(() => {
 		const root = editorRootRef.current;
@@ -922,19 +980,17 @@ function MarkdownTabSurface({
 					.config(nord)
 					.config((ctx) => {
 						ctx.set(rootCtx, root);
-						ctx.set(defaultValueCtx, tab.content);
+						ctx.set(defaultValueCtx, markdownContentRef.current);
 						ctx.get(listenerCtx).markdownUpdated((_ctx, markdown) => {
 							markdownContentRef.current = markdown;
-							onUpdateTabRef.current(tab.id, (current) => {
-								if (current.kind !== "markdown") return current;
-								if (current.content === markdown) return current;
-								return {
-									...current,
-									content: markdown,
-									dirty: markdown !== current.savedContent,
-									message: undefined,
-								};
-							});
+							const nextDirty = markdown !== savedContentRef.current;
+							markdownDirtyRef.current = nextDirty;
+							setIsDirty(nextDirty);
+							if (persistTimerRef.current) window.clearTimeout(persistTimerRef.current);
+							persistTimerRef.current = window.setTimeout(() => {
+								persistTimerRef.current = null;
+								persistMarkdownDraft(markdown);
+							}, 300);
 						});
 					});
 
@@ -952,11 +1008,12 @@ function MarkdownTabSurface({
 
 		return () => {
 			disposed = true;
+			flushMarkdownDraft();
 			const current = editorRef.current;
 			editorRef.current = null;
 			if (current) void current.destroy();
 		};
-	}, [tab.id]);
+	}, [flushMarkdownDraft, persistMarkdownDraft, tab.id]);
 
 	useEffect(() => {
 		if (!saveMessage) return;
@@ -978,11 +1035,11 @@ function MarkdownTabSurface({
 	}, [saveMarkdown]);
 
 	return (
-		<div className="pane-tab-surface active tw-flex tw-min-h-0 tw-flex-1">
+		<div className={`pane-tab-surface ${isActive ? "active" : "inactive"} tw-flex tw-min-h-0 tw-flex-1`}>
 			<div className="markdown-surface milkdown-surface tw-flex tw-min-h-0 tw-flex-1 tw-flex-col">
 				<div className="markdown-meta-row" title={tab.filePath}>
 					<span className="editor-path">{tab.filePath}</span>
-					<button type="button" className="editor-save-button" onClick={() => void saveMarkdown()} disabled={!tab.dirty}>
+					<button type="button" className="editor-save-button" onClick={() => void saveMarkdown()} disabled={!isDirty}>
 						Save
 					</button>
 				</div>
@@ -994,7 +1051,7 @@ function MarkdownTabSurface({
 	);
 }
 
-function ImageTabSurface({ tab }: { tab: ImageTabModel }) {
+function ImageTabSurface({ tab, isActive }: { tab: ImageTabModel; isActive: boolean }) {
 	const [scale, setScale] = useState(1);
 	const [offset, setOffset] = useState({ x: 0, y: 0 });
 	const [imageSrc, setImageSrc] = useState<string | null>(null);
@@ -1009,10 +1066,9 @@ function ImageTabSurface({ tab }: { tab: ImageTabModel }) {
 		void (async () => {
 			if (typeof window === "undefined" || typeof window.mosaic === "undefined") return;
 			try {
-				const base64 = await window.mosaic.readFileBase64(tab.filePath);
+				const fileUrl = window.mosaic.filePathToUrl(tab.filePath);
 				if (cancelled) return;
-				const mime = getMimeTypeForImage(tab.filePath);
-				setImageSrc(`data:${mime};base64,${base64}`);
+				setImageSrc(fileUrl);
 			} catch (error) {
 				if (cancelled) return;
 				setLoadError(error instanceof Error ? error.message : "Failed to load image.");
@@ -1025,7 +1081,7 @@ function ImageTabSurface({ tab }: { tab: ImageTabModel }) {
 	}, [tab.filePath]);
 
 	return (
-		<div className="pane-tab-surface active media-surface tw-flex tw-min-h-0 tw-flex-1 tw-flex-col">
+		<div className={`pane-tab-surface ${isActive ? "active" : "inactive"} media-surface tw-flex tw-min-h-0 tw-flex-1 tw-flex-col`}>
 			<div className="editor-meta-row">
 				<span className="editor-path" title={tab.filePath}>{tab.filePath}</span>
 				<button type="button" className="editor-save-button" onClick={() => setScale((s) => Math.max(0.2, s - 0.1))}>-</button>
@@ -1079,12 +1135,11 @@ function ImageTabSurface({ tab }: { tab: ImageTabModel }) {
 	);
 }
 
-function PdfTabSurface({ tab }: { tab: PdfTabModel }) {
+function PdfTabSurface({ tab, isActive }: { tab: PdfTabModel; isActive: boolean }) {
 	const [numPages, setNumPages] = useState(0);
 	const [pageNumber, setPageNumber] = useState(1);
 	const [scale, setScale] = useState(1);
-	const [pdfObjectUrl, setPdfObjectUrl] = useState<string | null>(null);
-	const pdfObjectUrlRef = useRef<string | null>(null);
+	const [pdfFileUrl, setPdfFileUrl] = useState<string | null>(null);
 	const [pdfLoadError, setPdfLoadError] = useState<string | null>(null);
 	const [pdfComponents, setPdfComponents] = useState<null | {
 		Document: (props: Record<string, unknown>) => JSX.Element;
@@ -1114,11 +1169,7 @@ function PdfTabSurface({ tab }: { tab: PdfTabModel }) {
 
 	useEffect(() => {
 		let cancelled = false;
-		if (pdfObjectUrlRef.current) {
-			URL.revokeObjectURL(pdfObjectUrlRef.current);
-			pdfObjectUrlRef.current = null;
-		}
-		setPdfObjectUrl(null);
+		setPdfFileUrl(null);
 		setPdfLoadError(null);
 		setNumPages(0);
 		setPageNumber(1);
@@ -1126,13 +1177,9 @@ function PdfTabSurface({ tab }: { tab: PdfTabModel }) {
 		void (async () => {
 			if (typeof window === "undefined" || typeof window.mosaic === "undefined") return;
 			try {
-				const base64 = await window.mosaic.readFileBase64(tab.filePath);
+				const fileUrl = window.mosaic.filePathToUrl(tab.filePath);
 				if (cancelled) return;
-				const bytes = base64ToUint8Array(base64);
-				const blob = new Blob([bytes], { type: "application/pdf" });
-				const objectUrl = URL.createObjectURL(blob);
-				pdfObjectUrlRef.current = objectUrl;
-				setPdfObjectUrl(objectUrl);
+				setPdfFileUrl(fileUrl);
 			} catch (error) {
 				if (cancelled) return;
 				setPdfLoadError(error instanceof Error ? error.message : "Failed to load PDF.");
@@ -1141,10 +1188,6 @@ function PdfTabSurface({ tab }: { tab: PdfTabModel }) {
 
 		return () => {
 			cancelled = true;
-			if (pdfObjectUrlRef.current) {
-				URL.revokeObjectURL(pdfObjectUrlRef.current);
-				pdfObjectUrlRef.current = null;
-			}
 		};
 	}, [tab.filePath]);
 
@@ -1152,7 +1195,7 @@ function PdfTabSurface({ tab }: { tab: PdfTabModel }) {
 	const PageComponent = pdfComponents?.Page;
 
 	return (
-		<div className="pane-tab-surface active media-surface tw-flex tw-min-h-0 tw-flex-1 tw-flex-col">
+		<div className={`pane-tab-surface ${isActive ? "active" : "inactive"} media-surface tw-flex tw-min-h-0 tw-flex-1 tw-flex-col`}>
 			<div className="editor-meta-row">
 				<span className="editor-path" title={tab.filePath}>{tab.filePath}</span>
 				<button type="button" className="editor-save-button" onClick={() => setPageNumber((current) => Math.max(1, current - 1))} disabled={pageNumber <= 1}>
@@ -1172,9 +1215,9 @@ function PdfTabSurface({ tab }: { tab: PdfTabModel }) {
 			</div>
 			<div className="pdf-canvas">
 				{pdfLoadError ? <div className="pdf-loading">{pdfLoadError}</div> : null}
-				{!pdfLoadError && DocumentComponent && PageComponent && pdfObjectUrl ? (
+				{!pdfLoadError && DocumentComponent && PageComponent && pdfFileUrl ? (
 					<DocumentComponent
-						file={pdfObjectUrl}
+						file={pdfFileUrl}
 						onLoadSuccess={({ numPages: totalPages }: { numPages: number }) => {
 							setNumPages(totalPages);
 							setPageNumber((current) => Math.min(Math.max(current, 1), totalPages));
@@ -1188,7 +1231,7 @@ function PdfTabSurface({ tab }: { tab: PdfTabModel }) {
 						<PageComponent pageNumber={pageNumber} scale={scale} />
 					</DocumentComponent>
 				) : null}
-				{!pdfLoadError && (!DocumentComponent || !PageComponent || !pdfObjectUrl) ? <div className="pdf-loading">Loading PDF…</div> : null}
+				{!pdfLoadError && (!DocumentComponent || !PageComponent || !pdfFileUrl) ? <div className="pdf-loading">Loading PDF…</div> : null}
 			</div>
 		</div>
 	);
@@ -1220,10 +1263,21 @@ export function TerminalPane({
 	onUpdateTab,
 }: TerminalPaneProps) {
 	const activeTab = pane.tabs.find((tab) => tab.id === pane.activeTabId) ?? pane.tabs[0];
+	const [mountedTabIds, setMountedTabIds] = useState<string[]>(() => (activeTab ? [activeTab.id] : []));
 	const [tabDropActive, setTabDropActive] = useState(false);
 	const [draggingTabId, setDraggingTabId] = useState<string | null>(null);
 	const [paneBodyDropActive, setPaneBodyDropActive] = useState(false);
 	const [paneBodyDropPosition, setPaneBodyDropPosition] = useState<PaneDropPosition | null>(null);
+
+	useEffect(() => {
+		if (!activeTab) return;
+		setMountedTabIds((current) => (current.includes(activeTab.id) ? current : [...current, activeTab.id]));
+	}, [activeTab]);
+
+	useEffect(() => {
+		const nextTabIds = new Set(pane.tabs.map((tab) => tab.id));
+		setMountedTabIds((current) => current.filter((tabId) => nextTabIds.has(tabId)));
+	}, [pane.tabs]);
 
 	const handleTabStripDragOver = useCallback(
 		(event: ReactDragEvent<HTMLDivElement>) => {
@@ -1277,6 +1331,9 @@ export function TerminalPane({
 	);
 
 	const activeTabTitle = activeTab?.title ?? "Pane";
+	const renderedTabs = activeTab
+		? pane.tabs.filter((tab) => mountedTabIds.includes(tab.id) || tab.id === activeTab.id)
+		: pane.tabs;
 
 	return (
 		<section
@@ -1328,7 +1385,7 @@ export function TerminalPane({
 								key={tab.id}
 								type="button"
 								draggable
-								className={`pane-tab-button ${tab.id === activeTab.id ? "active" : ""} ${draggingTabId === tab.id ? "tab-dragging" : ""}`}
+								className={`pane-tab-button ${tab.id === activeTab?.id ? "active" : ""} ${draggingTabId === tab.id ? "tab-dragging" : ""}`}
 								onDragStart={(event) => {
 									setDraggingTabId(tab.id);
 									event.dataTransfer.effectAllowed = "move";
@@ -1370,9 +1427,6 @@ export function TerminalPane({
 					})}
 					<button type="button" className="pane-tab-add" onClick={onAddTab} aria-label="Open a new terminal tab">
 						+
-					</button>
-					<button type="button" className="pane-tab-add browser" onClick={onAddBrowserTab} aria-label="Open a new browser tab">
-						◉
 					</button>
 				</div>
 
@@ -1429,23 +1483,38 @@ export function TerminalPane({
 						<div className={`pane-drop-zone center ${paneBodyDropPosition === "center" ? "active" : ""}`} />
 					</div>
 				) : null}
-				{activeTab.kind === "terminal" ? (
-					<TerminalTabSurface
-						key={activeTab.id}
-						tab={activeTab}
-						accent={accent}
-						theme={theme}
-						cwd={cwd}
-						isActive
-						onUpdateTabMeta={(patch) => onUpdateTabMeta(activeTab.id, patch)}
-					/>
-				) : null}
-				{activeTab.kind === "fileTree" ? <FileTreeTabSurface tab={activeTab} onOpenFile={onOpenFile} /> : null}
-				{activeTab.kind === "editor" ? <EditorTabSurface tab={activeTab} theme={theme} onUpdateTab={onUpdateTab} /> : null}
-				{activeTab.kind === "markdown" ? <MarkdownTabSurface tab={activeTab} onUpdateTab={onUpdateTab} /> : null}
-				{activeTab.kind === "image" ? <ImageTabSurface tab={activeTab} /> : null}
-				{activeTab.kind === "pdf" ? <PdfTabSurface tab={activeTab} /> : null}
-				{activeTab.kind === "browser" ? <BrowserPane tab={activeTab} theme={theme} onUpdateTab={onUpdateTab} /> : null}
+				{renderedTabs.map((tab) => {
+					const isActiveTab = tab.id === activeTab?.id;
+					if (tab.kind === "terminal") {
+						return (
+							<TerminalTabSurface
+								key={tab.id}
+								tab={tab}
+								accent={accent}
+								theme={theme}
+								cwd={cwd}
+								isActive={isActiveTab}
+								onUpdateTabMeta={(patch) => onUpdateTabMeta(tab.id, patch)}
+							/>
+						);
+					}
+					if (tab.kind === "fileTree") {
+						return <FileTreeTabSurface key={tab.id} tab={tab} onOpenFile={onOpenFile} isActive={isActiveTab} />;
+					}
+					if (tab.kind === "editor") {
+						return <EditorTabSurface key={tab.id} tab={tab} theme={theme} onUpdateTab={onUpdateTab} isActive={isActiveTab} />;
+					}
+					if (tab.kind === "markdown") {
+						return <MarkdownTabSurface key={tab.id} tab={tab} onUpdateTab={onUpdateTab} isActive={isActiveTab} />;
+					}
+					if (tab.kind === "image") {
+						return <ImageTabSurface key={tab.id} tab={tab} isActive={isActiveTab} />;
+					}
+					if (tab.kind === "pdf") {
+						return <PdfTabSurface key={tab.id} tab={tab} isActive={isActiveTab} />;
+					}
+					return <BrowserPane key={tab.id} tab={tab} theme={theme} isActive={isActiveTab} onUpdateTab={onUpdateTab} />;
+				})}
 			</div>
 		</section>
 	);

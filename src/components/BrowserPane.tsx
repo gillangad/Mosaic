@@ -43,11 +43,13 @@ function safeInvoke<T>(action: () => T, fallback: T): T {
 interface BrowserPaneProps {
 	tab: BrowserTabModel;
 	theme: MosaicTheme;
+	isActive: boolean;
 	onUpdateTab: (tabId: string, updater: (tab: PaneTabModel) => PaneTabModel) => void;
 }
 
-export function BrowserPane({ tab, theme, onUpdateTab }: BrowserPaneProps) {
+export function BrowserPane({ tab, theme, isActive, onUpdateTab }: BrowserPaneProps) {
 	const webviewRef = useRef<BrowserWebviewElement | null>(null);
+	const cdpResolvedWebContentsIdRef = useRef<number | null>(null);
 	const [inputValue, setInputValue] = useState(tab.url || "about:blank");
 	const [navigationState, setNavigationState] = useState({ canGoBack: false, canGoForward: false, loading: false });
 	const [cdpTarget, setCdpTarget] = useState<string | null>(null);
@@ -58,6 +60,7 @@ export function BrowserPane({ tab, theme, onUpdateTab }: BrowserPaneProps) {
 	}, [tab.id, tab.url]);
 
 	useEffect(() => {
+		cdpResolvedWebContentsIdRef.current = null;
 		setWebviewReady(false);
 		setCdpTarget(null);
 		setNavigationState((current) => ({ ...current, canGoBack: false, canGoForward: false, loading: false }));
@@ -106,12 +109,14 @@ export function BrowserPane({ tab, theme, onUpdateTab }: BrowserPaneProps) {
 		if (!view?.getWebContentsId) return;
 		const webContentsId = safeInvoke(() => view.getWebContentsId?.() ?? 0, 0);
 		if (!Number.isFinite(webContentsId) || webContentsId <= 0) return;
+		if (cdpResolvedWebContentsIdRef.current === webContentsId) return;
 		try {
 			const target = await window.mosaic.getBrowserCdpTarget(
 				webContentsId,
 				safeInvoke(() => view.getURL?.() ?? tab.url, tab.url),
 				safeInvoke(() => view.getTitle?.() ?? tab.title, tab.title),
 			);
+			cdpResolvedWebContentsIdRef.current = webContentsId;
 			setCdpTarget(target?.webSocketDebuggerUrl ?? null);
 		} catch {
 			setCdpTarget(null);
@@ -138,7 +143,6 @@ export function BrowserPane({ tab, theme, onUpdateTab }: BrowserPaneProps) {
 			const nextTitle = customEvent.title ?? safeInvoke(() => view.getTitle?.() ?? "Browser", "Browser");
 			const nextUrl = safeInvoke(() => view.getURL?.() ?? tab.url, tab.url);
 			commitTabNavigation(nextUrl, nextTitle);
-			void refreshCdpTarget();
 		};
 
 		const handleNavigate = () => {
@@ -147,7 +151,6 @@ export function BrowserPane({ tab, theme, onUpdateTab }: BrowserPaneProps) {
 			setInputValue(nextUrl);
 			commitTabNavigation(nextUrl, safeInvoke(() => view.getTitle?.() ?? tab.title, tab.title));
 			refreshNavigationState();
-			void refreshCdpTarget();
 		};
 
 		const handleStartLoading = () => {
@@ -157,7 +160,6 @@ export function BrowserPane({ tab, theme, onUpdateTab }: BrowserPaneProps) {
 		const handleStopLoading = () => {
 			setNavigationState((current) => ({ ...current, loading: false }));
 			refreshNavigationState();
-			void refreshCdpTarget();
 		};
 
 		const handleGone = () => {
@@ -206,7 +208,7 @@ export function BrowserPane({ tab, theme, onUpdateTab }: BrowserPaneProps) {
 	const browserThemeClass = useMemo(() => (theme.kind === "light" ? "browser-pane-light" : "browser-pane-dark"), [theme.kind]);
 
 	return (
-		<div className={`pane-tab-surface active browser-pane-surface ${browserThemeClass} tw-flex tw-min-h-0 tw-flex-1 tw-flex-col`}>
+		<div className={`pane-tab-surface ${isActive ? "active" : "inactive"} browser-pane-surface ${browserThemeClass} tw-flex tw-min-h-0 tw-flex-1 tw-flex-col`}>
 			<div className="browser-toolbar tw-flex tw-items-center tw-gap-1 tw-px-2 tw-py-1">
 				<button
 					type="button"

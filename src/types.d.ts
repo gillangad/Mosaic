@@ -8,6 +8,46 @@ interface DirectoryEntry {
 	extension: string;
 }
 
+interface GitFileEntry {
+	path: string;
+	originalPath: string | null;
+	status: string;
+	staged: boolean;
+	unstaged: boolean;
+	raw: string;
+}
+
+interface GitStatusDetails {
+	isRepo: boolean;
+	branch: string | null;
+	summary: string;
+	dirty: boolean;
+	ahead: number;
+	behind: number;
+	changeCount: number;
+	rootPath: string | null;
+	files: GitFileEntry[];
+}
+
+interface GitBranchEntry {
+	name: string;
+	current: boolean;
+}
+
+interface GitCommitEntry {
+	hash: string;
+	shortHash: string;
+	author: string;
+	relativeTime: string;
+	subject: string;
+}
+
+interface GitStashEntry {
+	ref: string;
+	message: string;
+	relativeTime: string;
+}
+
 declare global {
 	namespace JSX {
 		interface IntrinsicElements {
@@ -23,9 +63,24 @@ declare global {
 			closeTerminal: (id: string) => Promise<void>;
 			pickWorkspaceDirectory: () => Promise<WorkspaceSelection | null>;
 			inspectWorkspace: (directoryPath: string) => Promise<WorkspaceSelection>;
+			gitStatus: (directoryPath: string, force?: boolean) => Promise<GitStatusDetails>;
+			gitBranches: (directoryPath: string) => Promise<GitBranchEntry[]>;
+			gitLog: (directoryPath: string, limit?: number) => Promise<GitCommitEntry[]>;
+			gitDiff: (directoryPath: string, filePath: string, cached?: boolean) => Promise<string>;
+			gitShowCommit: (directoryPath: string, hash: string) => Promise<string>;
+			gitStage: (directoryPath: string, filePath: string) => Promise<GitStatusDetails>;
+			gitUnstage: (directoryPath: string, filePath: string) => Promise<GitStatusDetails>;
+			gitCheckout: (directoryPath: string, branch: string) => Promise<GitStatusDetails>;
+			gitCommit: (directoryPath: string, message: string, amend?: boolean) => Promise<GitStatusDetails>;
+			gitPush: (directoryPath: string) => Promise<GitStatusDetails>;
+			gitPull: (directoryPath: string) => Promise<GitStatusDetails>;
+			gitStashList: (directoryPath: string) => Promise<GitStashEntry[]>;
+			gitStashApply: (directoryPath: string, ref: string) => Promise<GitStashEntry[]>;
+			gitStashDrop: (directoryPath: string, ref: string) => Promise<GitStashEntry[]>;
 			readDirectory: (workspacePath: string, directoryPath: string) => Promise<DirectoryEntry[]>;
 			readFile: (filePath: string) => Promise<string>;
-			readFileBase64: (filePath: string) => Promise<string>;
+			getFileInfo: (filePath: string) => Promise<{ size: number; mtimeMs: number }>;
+			filePathToUrl: (filePath: string) => string;
 			writeFile: (filePath: string, contents: string) => Promise<void>;
 			getBrowserCdpTarget: (
 				webContentsId: number,

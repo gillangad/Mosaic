@@ -1,81 +1,71 @@
 # Mosaic
 
-Mosaic is a desktop workspace for people who live in the terminal.
+**Agentic environment inspired by scrolling and tiling window managers.**
 
-It gives you directory-based workspaces, panes, splits, tabs, and a calmer visual shell around terminal-heavy work. The goal is not to replace the terminal. The goal is to make terminal workflows easier to organize, monitor, and return to.
+Mosaic is a desktop app for directory-based workspaces, multi-pane layouts, and terminal-centric workflows.
+It is designed to feel like a native shell for focused development: fast navigation, persistent layout state, and low-friction context switching.
 
-## What It Does
+## Current Feature Set
 
+### Workspaces
 - Open real directories as workspaces
-- Show each workspace as its own navigable surface, with path and git context in the workspace tab itself
-- Add new panes to the right inside a workspace without squeezing the existing layout; each new pane opens at half the width of a full lone pane
-- Split the current pane vertically or horizontally within its existing pane area, dividing only that pane's current space
-- Resize pane widths and heights with draggable dividers or keyboard shortcuts
-- Move focus between panes with the keyboard
-- Open multiple tabs inside each pane
-- Persist workspaces, pane layouts, and pane tabs between launches
-- Start new terminals in the selected workspace directory
-- Show lightweight git status for each workspace
-- Support multiple visual skins from `src/core/themes.ts`
+- Switch workspaces from a rail/pill UI
+- Workspace state is persisted between launches
 
-What does not persist yet:
+### Panes, Splits, and Tabs
+- Add panes and split panes vertically/horizontally
+- Drag-resize pane boundaries
+- Multiple tabs per pane
+- Pane focus and pane movement tools
+- Layout and pane-tab state persist between launches
 
-- terminal process contents
-- shell history inside a live session
-- background jobs after the app closes
+### Pane Tab Types
+Mosaic currently supports multiple pane/tab content types:
+- Terminal
+- Browser
+- Editor (text/code)
+- Markdown
+- Image
+- PDF
 
-## Current Direction
+### Docked Side Tools
+- **File picker dock** (left): directory tree + open file flow
+- **Git pane dock** (right): branch/status surface with changed files, inline diffs, commit flow, commit log, and stash actions
 
-Mosaic is currently:
+### Navigation and Overview
+- Overview mode for pane-level reorganization
+- Minimap for quick pane targeting
+- Command palette for fast actions
+- Keyboard shortcuts are available and configurable from settings
 
-- cross-platform (Windows, macOS, Linux)
-- Electron-based
-- powered by `node-pty` (renderer migrating from `xterm.js` to `ghostty-web`)
-- focused on fast iteration around layout, navigation, and workspace UX
+### Visual System
+- Theme/skin system is sourced from `src/core/themes.ts`
+- Built to keep a restrained, dark, native-like desktop feel
 
-The longer-term direction is to keep the product model strong and the architecture replaceable, so the shell and terminal engine can evolve later without throwing away the workspace ideas.
+## Persistence Notes
 
-## Screens and Concepts
+Persisted:
+- Workspaces
+- Layout tree (panes/splits)
+- Pane tabs and active tab selection
+- UI preferences (theme/orientation/dock widths)
 
-Core ideas in the current build:
+Not persisted as full session replay:
+- Live terminal process output/state after app exit
+- Background jobs after app closes
 
-- vertical workspace rail by default
-- settings tucked into a small contextual menu
-- themed skin picker that recolors the shell without restarting terminals
-- compact path labels like `.../parent/current`
-- browser-like pane tabs inside each pane
-- persistent layout scaffolding without pretending terminal state is magically resumable
+## Platform + Stack
 
-## Terminology
+- Electron
+- React + Vite
+- Framer Motion
+- `node-pty`
+- `xterm` (renderer migration toward `ghostty-web` is in progress)
 
-Mosaic uses four main words:
-
-- `workspace` = a selected directory that opens as its own top-level working area
-- `pane` = a top-level pane inside a workspace
-- `split` = a subdivision inside an existing pane
-- `tab` = a terminal tab inside a pane or split
-
-When needed:
-
-- `workspace tab` = the item in the workspace rail
-- `pane tab` = the browser-like tab inside a pane
-
-## Shortcuts
-
-Current built-in shortcuts:
-
-- `Ctrl+Shift+O` — open workspace
-- `Ctrl+Shift+Enter` — new pane
-- `Ctrl+Shift+Alt+%` — split pane vertically
-- `Ctrl+Shift+Alt+"` — split pane horizontally
-- `Ctrl+Shift+T` — new tab
-- `Ctrl+Shift+W` — close tab
-- `Ctrl+Tab` / `Ctrl+Shift+Tab` — next or previous tab
-- `Ctrl+Shift+Arrow` — move focus between panes
-- `Ctrl+Alt+Arrow` — resize focused pane
-- `Alt+Shift+Left` / `Alt+Shift+Up` — previous workspace
-- `Alt+Shift+Right` / `Alt+Shift+Down` — next workspace
-- `Ctrl+,` — open settings
+Targets:
+- Windows
+- macOS
+- Linux
 
 ## Run Locally
 
@@ -92,25 +82,31 @@ npm run build
 
 ## Package
 
-Build distributable binaries for your platform:
-
 ```bash
 npm run package
 ```
 
-Output goes to `release/`.
+Build output goes to `release/`.
 
-## Project Structure
+## Key Paths
 
-- `electron/main.mjs` — Electron window setup, PTY sessions, directory picker, workspace inspection
+- `electron/main.mjs` — Electron lifecycle, PTY + Git + file/Git IPC
 - `electron/preload.cjs` — renderer bridge
-- `src/App.tsx` — shell, workspace navigation, settings, persistence
-- `src/WorkspaceView.tsx` — workspace surface and pane layout
-- `src/components/TerminalPane.tsx` — pane chrome, pane tabs, terminal mount
-- `src/core/layout.ts` — pane split, tab layout, focus movement, and resize helpers
-- `src/core/workspaces.ts` — workspace naming and persistence helpers
-- `src/core/themes.ts` — available skins and terminal palettes
+- `src/App.tsx` — shell, workspace switching, persistence, top-level controls
+- `src/WorkspaceView.tsx` — workspace canvas, splits, overview/minimap, dock integration
+- `src/components/TerminalPane.tsx` — pane chrome + tab UI + terminal integration
+- `src/components/FileTreeSidebar.tsx` — file picker dock UI
+- `src/components/GitSidebar.tsx` — git dock UI
+- `src/core/layout.ts` — layout/split/resize operations
+- `src/core/themes.ts` — theme source of truth
 - `src/styles.css` — visual system
+
+## Terminology
+
+- **workspace** = selected directory at top level
+- **pane** = top-level pane inside a workspace
+- **split** = subdivision inside a pane
+- **tab** = tab inside a pane/split
 
 ## License
 
