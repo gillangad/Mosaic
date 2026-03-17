@@ -915,58 +915,29 @@ function findSplitById(root: LayoutNode, splitId: string): SplitLayoutNode | nul
 	return findSplitById(root.first, splitId) ?? findSplitById(root.second, splitId);
 }
 
-function resizeVerticalSplitKeepSecondWidth(node: SplitLayoutNode, deltaRatio: number): LayoutNode | null {
+function resizeVerticalSplitPreserveTotalWidth(node: SplitLayoutNode, deltaRatio: number): LayoutNode | null {
 	if (node.direction !== "vertical") return null;
 	const splitWidth = getNodeWidthUnits(node);
 	const deltaUnits = splitWidth * deltaRatio;
 	if (Math.abs(deltaUnits) < 1e-5) return null;
 
 	const firstWidth = getBranchWidthUnits(node, "first");
-	const secondWidth = getBranchWidthUnits(node, "second");
 	const minBranchWidth = Math.max(0.08, splitWidth * 0.08);
-	const requestedFirstWidth = Math.max(minBranchWidth, firstWidth + deltaUnits);
-	const nextFirstWidth = deltaUnits > 0
-		? Math.min(getResizeCap(), requestedFirstWidth)
-		: requestedFirstWidth;
+	const maxBranchWidth = getResizeCap();
+	const minFirstWidth = Math.max(minBranchWidth, splitWidth - maxBranchWidth);
+	const maxFirstWidth = Math.min(maxBranchWidth, splitWidth - minBranchWidth);
+	const nextFirstWidth = Math.min(maxFirstWidth, Math.max(minFirstWidth, firstWidth + deltaUnits));
 	if (Math.abs(nextFirstWidth - firstWidth) < 1e-6) return null;
 
-	const nextWidthUnits = nextFirstWidth + secondWidth;
-	const nextRatio = nextFirstWidth / nextWidthUnits;
+	const nextSecondWidth = splitWidth - nextFirstWidth;
+	const nextRatio = nextFirstWidth / splitWidth;
 	const safeRatio = Math.min(0.999, Math.max(0.001, nextRatio));
 
 	return {
 		...node,
 		ratio: safeRatio,
-		widthUnits: nextWidthUnits,
+		widthUnits: splitWidth,
 		first: resizeLayoutWidth(node.first, nextFirstWidth),
-		second: resizeLayoutWidth(node.second, secondWidth),
-	};
-}
-
-function resizeVerticalSplitKeepFirstWidth(node: SplitLayoutNode, deltaRatio: number): LayoutNode | null {
-	if (node.direction !== "vertical") return null;
-	const splitWidth = getNodeWidthUnits(node);
-	const deltaUnits = splitWidth * deltaRatio;
-	if (Math.abs(deltaUnits) < 1e-5) return null;
-
-	const firstWidth = getBranchWidthUnits(node, "first");
-	const secondWidth = getBranchWidthUnits(node, "second");
-	const minBranchWidth = Math.max(0.08, splitWidth * 0.08);
-	const requestedSecondWidth = Math.max(minBranchWidth, secondWidth + deltaUnits);
-	const nextSecondWidth = deltaUnits > 0
-		? Math.min(getResizeCap(), requestedSecondWidth)
-		: requestedSecondWidth;
-	if (Math.abs(nextSecondWidth - secondWidth) < 1e-6) return null;
-
-	const nextWidthUnits = firstWidth + nextSecondWidth;
-	const nextRatio = firstWidth / nextWidthUnits;
-	const safeRatio = Math.min(0.999, Math.max(0.001, nextRatio));
-
-	return {
-		...node,
-		ratio: safeRatio,
-		widthUnits: nextWidthUnits,
-		first: resizeLayoutWidth(node.first, firstWidth),
 		second: resizeLayoutWidth(node.second, nextSecondWidth),
 	};
 }
@@ -975,16 +946,14 @@ export function resizeVerticalSplitByDelta(
 	root: LayoutNode,
 	splitId: string,
 	deltaRatio: number,
-	branch: "first" | "second" = "first",
+	_branch: "first" | "second" = "first",
 ): LayoutNode {
 	const path = findSplitPath(root, splitId);
 	if (path === null) return root;
 	const target = findSplitById(root, splitId);
 	if (!target) return root;
 
-	const resizedTarget = branch === "first"
-		? resizeVerticalSplitKeepSecondWidth(target, deltaRatio)
-		: resizeVerticalSplitKeepFirstWidth(target, deltaRatio);
+	const resizedTarget = resizeVerticalSplitPreserveTotalWidth(target, deltaRatio);
 	if (!resizedTarget) return root;
 
 	return rebuildPathAfterResize(path, path.length, resizedTarget);

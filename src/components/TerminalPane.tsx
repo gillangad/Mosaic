@@ -69,7 +69,7 @@ interface FileTreeEntry {
 
 function buildTerminalTheme(theme: MosaicTheme, accent: string) {
 	return {
-		background: theme.bgWell,
+		background: "#0B0B0E",
 		foreground: theme.terminal.foreground,
 		cursor: accent,
 		cursorAccent: theme.terminal.cursorAccent,

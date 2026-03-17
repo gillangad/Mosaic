@@ -60,35 +60,38 @@ describe("layout column operations", () => {
 });
 
 describe("layout resizing invariants", () => {
-	it("resizeVerticalSplitByDelta preserves sibling width when resizing second branch", () => {
+	it("resizeVerticalSplitByDelta keeps total width stable while moving divider", () => {
 		const layout = appendPaneToRight(createPaneNode(WORKSPACE_PATH), WORKSPACE_PATH);
 		expect(layout.type).toBe("split");
 		if (layout.type !== "split" || layout.direction !== "vertical") return;
 
 		const before = getVerticalBranchWidths(layout);
+		const beforeTotal = before.first + before.second;
 		const resized = resizeVerticalSplitByDelta(layout, layout.id, 0.16, "second");
 		const split = findSplitById(resized, layout.id);
 		expect(split).not.toBeNull();
 		if (!split || split.direction !== "vertical") return;
 
 		const after = getVerticalBranchWidths(split);
-		expect(after.first).toBeCloseTo(before.first, 6);
-		expect(after.second).toBeGreaterThan(before.second);
+		const afterTotal = after.first + after.second;
+		expect(afterTotal).toBeCloseTo(beforeTotal, 6);
+		expect(after.first).toBeGreaterThan(before.first);
+		expect(after.second).toBeLessThan(before.second);
 	});
 
-	it("resizeVerticalSplitByDelta allows branch growth past 100 width units", () => {
+	it("resizeVerticalSplitByDelta respects branch cap at 200 width units", () => {
 		const layout = appendPaneToRight(createPaneNode(WORKSPACE_PATH), WORKSPACE_PATH);
 		expect(layout.type).toBe("split");
 		if (layout.type !== "split" || layout.direction !== "vertical") return;
 
-		const resized = resizeVerticalSplitByDelta(layout, layout.id, 2.5, "first");
+		const resized = resizeVerticalSplitByDelta(layout, layout.id, 5, "first");
 		const split = findSplitById(resized, layout.id);
 		expect(split).not.toBeNull();
 		if (!split || split.direction !== "vertical") return;
 
 		const after = getVerticalBranchWidths(split);
-		expect(after.first).toBeGreaterThan(100);
-		expect(after.second).toBeCloseTo(50, 6);
+		expect(after.first).toBeLessThanOrEqual(200);
+		expect(after.second).toBeGreaterThan(0);
 	});
 
 	it("updateSplitRatio preserves second branch width for vertical split", () => {

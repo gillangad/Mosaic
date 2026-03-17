@@ -59,5 +59,6 @@ terraform.tfvars
 terraform.tfvars.json
 
 # Internal docs — ignore all markdown except README
+layout.md
 *.md
 !README.md

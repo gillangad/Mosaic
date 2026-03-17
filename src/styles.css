@@ -2069,23 +2069,23 @@ select {
 }
 
 .layout-resizer-vertical {
-	width: 14px;
+	width: 8px;
 	display: flex;
 	align-items: stretch;
 	justify-content: space-between;
-	gap: 4px;
+	gap: 0;
 }
 
 .layout-edge-handle {
 	border: none;
 	padding: 0;
-	width: 5px;
+	width: 4px;
 	cursor: col-resize;
 	background: transparent;
 }
 
 .layout-resizer-horizontal {
-	height: 10px;
+	height: 8px;
 	width: 100%;
 	cursor: row-resize;
 	border: none;
@@ -2143,6 +2143,11 @@ body.is-resizing {
 .terminal-pane.zoomed {
 	box-shadow: 0 0 0 1px color-mix(in srgb, var(--workspace-accent, var(--accent-amber)) 16%, transparent),
 		0 0 42px -10px color-mix(in srgb, var(--workspace-accent, var(--accent-amber)) 26%, transparent);
+}
+
+.layout-leaf > .terminal-pane,
+.pane-zoom-shell > .terminal-pane {
+	margin: 3px;
 }
 
 .terminal-pane-accent {

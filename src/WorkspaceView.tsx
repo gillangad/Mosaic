@@ -158,7 +158,7 @@ function LayoutView({
 			lastClientX = moveEvent.clientX;
 			if (Math.abs(deltaPx) < 0.01) return;
 			const deltaRatio = deltaPx / Math.max(rect.width, 1);
-			onResizeVerticalSplitBranch(node.id, branch, branch === "first" ? deltaRatio : -deltaRatio);
+			onResizeVerticalSplitBranch(node.id, branch, deltaRatio);
 		};
 		const handleUp = () => {
 			window.removeEventListener("mousemove", handleMove);
