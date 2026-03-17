@@ -145,16 +145,20 @@ function LayoutView({
 		window.addEventListener("mouseup", handleUp);
 	};
 
-	const beginVerticalResize = (event: ReactMouseEvent<HTMLButtonElement>) => {
+	const beginVerticalResize = (branch: "first" | "second") => (event: ReactMouseEvent<HTMLButtonElement>) => {
 		const container = event.currentTarget.closest(".layout-split") as HTMLDivElement | null;
 		if (!container) return;
 		event.preventDefault();
 		event.stopPropagation();
 
 		const rect = container.getBoundingClientRect();
+		let lastClientX = event.clientX;
 		const handleMove = (moveEvent: MouseEvent) => {
-			const nextRatio = (moveEvent.clientX - rect.left) / Math.max(rect.width, 1);
-			onResizeHorizontalSplit(node.id, nextRatio);
+			const deltaPx = moveEvent.clientX - lastClientX;
+			lastClientX = moveEvent.clientX;
+			if (Math.abs(deltaPx) < 0.01) return;
+			const deltaRatio = deltaPx / Math.max(rect.width, 1);
+			onResizeVerticalSplitBranch(node.id, branch, branch === "first" ? deltaRatio : -deltaRatio);
 		};
 		const handleUp = () => {
 			window.removeEventListener("mousemove", handleMove);
@@ -202,12 +206,20 @@ function LayoutView({
 				/>
 			</div>
 			{node.direction === "vertical" ? (
-				<button
-					type="button"
-					className="layout-resizer layout-resizer-vertical"
-					onMouseDown={beginVerticalResize}
-					aria-label="Resize columns"
-				/>
+				<div className="layout-resizer layout-resizer-vertical" role="separator" aria-label="Resize columns">
+					<button
+						type="button"
+						className="layout-edge-handle first"
+						onMouseDown={beginVerticalResize("first")}
+						aria-label="Resize right edge of left pane"
+					/>
+					<button
+						type="button"
+						className="layout-edge-handle second"
+						onMouseDown={beginVerticalResize("second")}
+						aria-label="Resize left edge of right pane"
+					/>
+				</div>
 			) : (
 				<button
 					type="button"

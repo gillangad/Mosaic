@@ -71,11 +71,23 @@ export function GitSidebar({ workspacePath, git, onRefresh }: GitSidebarProps) {
 	const loadStatus = useCallback(
 		async (force = false) => {
 			const nextStatus = await window.mosaic.gitStatus(workspacePath, force);
-			setStatus(nextStatus);
-			refreshWorkspaceBadge();
+			setStatus((current) => {
+				if (
+					current.branch === nextStatus.branch &&
+					current.summary === nextStatus.summary &&
+					current.dirty === nextStatus.dirty &&
+					current.ahead === nextStatus.ahead &&
+					current.behind === nextStatus.behind &&
+					current.changeCount === nextStatus.changeCount &&
+					current.files.length === nextStatus.files.length
+				) {
+					return current;
+				}
+				return nextStatus;
+			});
 			return nextStatus;
 		},
-		[refreshWorkspaceBadge, workspacePath],
+		[workspacePath],
 	);
 
 	const loadSidebarData = useCallback(async () => {
@@ -88,7 +100,6 @@ export function GitSidebar({ workspacePath, git, onRefresh }: GitSidebarProps) {
 				setBranches([]);
 				setCommits([]);
 				setStashes([]);
-				refreshWorkspaceBadge();
 				return;
 			}
 
@@ -118,14 +129,19 @@ export function GitSidebar({ workspacePath, git, onRefresh }: GitSidebarProps) {
 		setAmendCommit(false);
 		setError(null);
 		void loadSidebarData();
-	}, [git, loadSidebarData, workspacePath]);
+	}, [workspacePath, loadSidebarData]);
+
+	useEffect(() => {
+		setStatus((current) => ({ ...current, ...git }));
+	}, [git]);
 
 	useEffect(() => {
 		const timer = window.setInterval(() => {
+			if (document.hidden) return;
 			void loadStatus(false).catch(() => {
 				// Silent poll failures are surfaced on next interactive action.
 			});
-		}, 3_000);
+		}, 8_000);
 		return () => window.clearInterval(timer);
 	}, [loadStatus]);
 

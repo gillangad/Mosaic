@@ -484,6 +484,20 @@ function GitPaneToggleIcon() {
 	);
 }
 
+function SettingsIcon() {
+	return (
+		<svg className="file-tree-toggle-icon" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+			<path
+				d="M6.7 1.5h2.6l.4 1.5a5.5 5.5 0 0 1 1.2.5l1.3-.8 1.8 1.8-.8 1.3c.2.4.4.8.5 1.2l1.5.4v2.6l-1.5.4a5.6 5.6 0 0 1-.5 1.2l.8 1.3-1.8 1.8-1.3-.8a5.5 5.5 0 0 1-1.2.5l-.4 1.5H6.7l-.4-1.5a5.5 5.5 0 0 1-1.2-.5l-1.3.8-1.8-1.8.8-1.3a5.5 5.5 0 0 1-.5-1.2L1 10.4V7.8l1.5-.4c.1-.4.3-.8.5-1.2l-.8-1.3 1.8-1.8 1.3.8c.4-.2.8-.4 1.2-.5z"
+				stroke="currentColor"
+				strokeWidth="1"
+				strokeLinejoin="round"
+			/>
+			<circle cx="8" cy="9" r="2" stroke="currentColor" strokeWidth="1" />
+		</svg>
+	);
+}
+
 function FloatingFileTreePane({
 	rootPath,
 	onOpenFile,
@@ -1863,7 +1877,41 @@ export function App() {
 		</Reorder.Group>
 	);
 
-	const fileTreePanel = null;
+	const fileTreePanel = fileTreeOpen && activeWorkspace && typeof document !== "undefined"
+		? createPortal(
+			<>
+				<button
+					type="button"
+					className="file-tree-scrim"
+					onMouseDown={(event) => {
+						event.preventDefault();
+						closeFileTree();
+					}}
+					aria-label="Close file tree"
+				/>
+				<div
+					ref={fileTreePanelRef}
+					className="file-tree-popover-anchor"
+					style={{
+						left: `${fileTreePanelPosition.left}px`,
+						top: `${fileTreePanelPosition.top}px`,
+						maxHeight: `${fileTreePanelPosition.maxHeight}px`,
+					}}
+				>
+					<FloatingFileTreePane
+						rootPath={activeWorkspace.path}
+						onOpenFile={(filePath) => void openFileFromTree(activeWorkspace.id, filePath)}
+						onClose={closeFileTree}
+						style={{
+							width: `${fileTreeWidth}px`,
+							maxHeight: `${fileTreePanelPosition.maxHeight}px`,
+						}}
+					/>
+				</div>
+			</>,
+			document.body,
+		)
+		: null;
 
 	const settingsPanel = settingsOpen && typeof document !== "undefined"
 		? createPortal(
@@ -1895,11 +1943,6 @@ export function App() {
 					{settingsView === "root" ? (
 						<>
 							<div className="settings-panel-header">Settings</div>
-							<button type="button" className="settings-item" onClick={() => setSettingsView("skins")}>
-								<span className="settings-item-icon">◑</span>
-								<span className="settings-item-copy">Skins</span>
-								<span className="settings-item-chevron">›</span>
-							</button>
 							<button type="button" className="settings-item" onClick={() => setSettingsView("shortcuts")}>
 								<span className="settings-item-icon">⌨</span>
 								<span className="settings-item-copy">Shortcuts</span>
@@ -2017,7 +2060,7 @@ export function App() {
 									}}
 									aria-label="Open settings"
 								>
-									⚙
+									<SettingsIcon />
 								</button>
 							</div>
 						</div>
@@ -2064,7 +2107,7 @@ export function App() {
 										}}
 										aria-label="Open settings"
 									>
-										⚙
+										<SettingsIcon />
 									</button>
 								</div>
 								<button type="button" className="icon-button workspace-tab-add" onClick={addWorkspace} aria-label="Open directory">
@@ -2110,7 +2153,7 @@ export function App() {
 										accent={activeWorkspaceAccent}
 										theme={currentTheme}
 										focusMode="center"
-										fileTreeOpen={fileTreeOpen}
+										fileTreeOpen={false}
 										fileTreeWidth={fileTreeWidth}
 										onFileTreeWidthChange={setFileTreeWidth}
 										gitPaneOpen={gitPaneOpen}

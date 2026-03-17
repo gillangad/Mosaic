@@ -5,10 +5,10 @@ Mosaic is a desktop workspace for people who live in the terminal.
 It gives you directory-based workspaces, panes, splits, tabs, and a calmer visual shell around terminal-heavy work. The goal is not to replace the terminal. The goal is to make terminal workflows easier to organize, monitor, and return to.
 
 <p align="center">
-  <video src="./docs/media/mosaic-overview.mp4" controls autoplay loop muted playsinline width="960"></video>
+  <video src="docs/media/mosaic-overview.mp4" controls playsinline width="960"></video>
 </p>
 
-If the inline player does not render in your viewer, open `docs/media/mosaic-overview.mp4` directly.
+[Open the demo video directly](docs/media/mosaic-overview.mp4)
 
 ## What It Does
 
