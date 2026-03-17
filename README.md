@@ -4,9 +4,7 @@ Mosaic is a desktop workspace for people who live in the terminal.
 
 It gives you directory-based workspaces, panes, splits, tabs, and a calmer visual shell around terminal-heavy work. The goal is not to replace the terminal. The goal is to make terminal workflows easier to organize, monitor, and return to.
 
-<p align="center">
-  <video src="https://github.com/user-attachments/assets/9d43d405-c2b8-4428-a594-d6f52510b9af" controls playsinline width="960"></video>
-</p>
+https://github.com/user-attachments/assets/9d43d405-c2b8-4428-a594-d6f52510b9af
 
 ## What It Does
 
