@@ -192,7 +192,7 @@ function convertWindowsWslUncToLinuxPath(directoryPath) {
 async function runGit(args, directoryPath) {
 	const wslPath = convertWindowsWslUncToLinuxPath(directoryPath);
 	if (wslPath) {
-		return execFileAsync("wsl.exe", ["--distribution", wslPath.distro, "--cd", wslPath.linuxPath, "git", ...args], {
+		return execFileAsync("wsl.exe", ["--distribution", wslPath.distro, "--cd", wslPath.linuxPath, "--exec", "git", ...args], {
 			timeout: GIT_COMMAND_TIMEOUT_MS,
 			maxBuffer: 1024 * 1024,
 			windowsHide: true,

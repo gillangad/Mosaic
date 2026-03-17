@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { FileTreeSidebar } from "./components/FileTreeSidebar";
 import { GitSidebar } from "./components/GitSidebar";
 import { TerminalPane } from "./components/TerminalPane";
@@ -7,7 +7,6 @@ import {
 	addTabToPane,
 	closeTab,
 	COLUMN_INSERT_WIDTH_UNITS,
-	countPanes,
 	enforcePaneWidthCap,
 	WIDTH_UNIT_BASE,
 	findFirstPaneId,
@@ -31,6 +30,9 @@ import type { MosaicTheme } from "./core/themes";
 import { useSessionManager } from "./core/terminal-backend-context";
 
 type FocusMode = "default" | "center" | "edge";
+
+const FILE_TREE_MIN_WIDTH = 180;
+const FILE_TREE_MAX_WIDTH = 520;
 
 interface LayoutViewProps {
 	node: LayoutNode;
@@ -64,7 +66,7 @@ interface LayoutViewProps {
 	onUpdateTab: (paneId: string, tabId: string, updater: (tab: PaneTabModel) => PaneTabModel) => void;
 }
 
-const LayoutView = memo(function LayoutView({
+function LayoutView({
 	node,
 	accent,
 	theme,
@@ -128,28 +130,11 @@ const LayoutView = memo(function LayoutView({
 		if (!container) return;
 
 		const rect = container.getBoundingClientRect();
-		let pendingRatio: number | null = null;
-		let frameId: number | null = null;
-		const flush = () => {
-			frameId = null;
-			if (pendingRatio === null) return;
-			onResizeHorizontalSplit(node.id, pendingRatio);
-			pendingRatio = null;
-		};
 		const handleMove = (moveEvent: MouseEvent) => {
-			pendingRatio = (moveEvent.clientY - rect.top) / rect.height;
-			if (frameId !== null) return;
-			frameId = window.requestAnimationFrame(flush);
+			const nextRatio = (moveEvent.clientY - rect.top) / rect.height;
+			onResizeHorizontalSplit(node.id, nextRatio);
 		};
 		const handleUp = () => {
-			if (frameId !== null) {
-				window.cancelAnimationFrame(frameId);
-				frameId = null;
-			}
-			if (pendingRatio !== null) {
-				onResizeHorizontalSplit(node.id, pendingRatio);
-				pendingRatio = null;
-			}
 			window.removeEventListener("mousemove", handleMove);
 			window.removeEventListener("mouseup", handleUp);
 			document.body.classList.remove("is-resizing");
@@ -160,40 +145,18 @@ const LayoutView = memo(function LayoutView({
 		window.addEventListener("mouseup", handleUp);
 	};
 
-	const beginVerticalResize = (branch: "first" | "second") => (event: ReactMouseEvent<HTMLButtonElement>) => {
+	const beginVerticalResize = (event: ReactMouseEvent<HTMLButtonElement>) => {
 		const container = event.currentTarget.closest(".layout-split") as HTMLDivElement | null;
 		if (!container) return;
 		event.preventDefault();
 		event.stopPropagation();
 
 		const rect = container.getBoundingClientRect();
-		let lastClientX = event.clientX;
-		let pendingDeltaRatio: number | null = null;
-		let frameId: number | null = null;
-		const flush = () => {
-			frameId = null;
-			if (pendingDeltaRatio === null) return;
-			onResizeVerticalSplitBranch(node.id, branch, pendingDeltaRatio);
-			pendingDeltaRatio = null;
-		};
 		const handleMove = (moveEvent: MouseEvent) => {
-			const deltaPx = moveEvent.clientX - lastClientX;
-			lastClientX = moveEvent.clientX;
-			if (Math.abs(deltaPx) < 0.01) return;
-			const deltaRatio = deltaPx / Math.max(rect.width, 1);
-			pendingDeltaRatio = branch === "first" ? deltaRatio : -deltaRatio;
-			if (frameId !== null) return;
-			frameId = window.requestAnimationFrame(flush);
+			const nextRatio = (moveEvent.clientX - rect.left) / Math.max(rect.width, 1);
+			onResizeHorizontalSplit(node.id, nextRatio);
 		};
 		const handleUp = () => {
-			if (frameId !== null) {
-				window.cancelAnimationFrame(frameId);
-				frameId = null;
-			}
-			if (pendingDeltaRatio !== null) {
-				onResizeVerticalSplitBranch(node.id, branch, pendingDeltaRatio);
-				pendingDeltaRatio = null;
-			}
 			window.removeEventListener("mousemove", handleMove);
 			window.removeEventListener("mouseup", handleUp);
 			document.body.classList.remove("is-resizing");
@@ -239,14 +202,12 @@ const LayoutView = memo(function LayoutView({
 				/>
 			</div>
 			{node.direction === "vertical" ? (
-				<div className="layout-resizer layout-resizer-vertical" role="separator" aria-label="Resize columns">
-					<button
-						type="button"
-						className="layout-edge-handle"
-						onMouseDown={beginVerticalResize("first")}
-						aria-label="Resize column boundary"
-					/>
-				</div>
+				<button
+					type="button"
+					className="layout-resizer layout-resizer-vertical"
+					onMouseDown={beginVerticalResize}
+					aria-label="Resize columns"
+				/>
 			) : (
 				<button
 					type="button"
@@ -292,7 +253,7 @@ const LayoutView = memo(function LayoutView({
 			</div>
 		</div>
 	);
-});
+}
 
 function clamp(value: number, min: number, max: number) {
 	return Math.min(max, Math.max(min, value));
@@ -793,35 +754,24 @@ function OverviewCanvas({ layout, focusedPaneId, initialDrag, onConsumeInitialDr
 			const columnIndex = paneColumnIndexByPaneId.get(paneRect.pane.id) ?? 0;
 			return columnIndex < columnInsertIndex ? paneRect : { ...paneRect, x: paneRect.x + OVERVIEW_COLUMN_INSERT_WIDTH_WORLD };
 		});
-	const panePreviewByTabId = useMemo(() => {
-		const previews = new Map<string, string>();
-		for (const paneRect of paneRects) {
-			const activeTab = paneRect.pane.tabs.find((tab) => tab.id === paneRect.pane.activeTabId) ?? paneRect.pane.tabs[0];
-			if (!activeTab) continue;
-			previews.set(activeTab.id, buildOverviewPreview(sessionManager.getSnapshot(activeTab.id) ?? ""));
-		}
-		return previews;
-	}, [paneRects, sessionManager]);
+	const draggedPane = dragState ? paneRects.find((rect) => rect.pane.id === dragState.sourcePaneId)?.pane ?? null : null;
+	const draggedActiveTab = draggedPane ? draggedPane.tabs.find((tab) => tab.id === draggedPane.activeTabId) ?? draggedPane.tabs[0] : null;
+	const draggedPreview = draggedActiveTab ? buildOverviewPreview(sessionManager.getSnapshot(draggedActiveTab.id) ?? "") : "No output yet";
 	const columnInsertPreview =
-		showOverviewColumnTargets && columnInsertIndex !== null
+		showOverviewColumnTargets &&
+		columnInsertIndex !== null &&
+		draggedPane &&
+		columnInsertIndex > 0 &&
+		columnInsertIndex < columnRects.length
 			? (() => {
 				const ghostWidth = OVERVIEW_COLUMN_INSERT_WIDTH_WORLD * camera.scale;
-				const leftBoundary = camera.x;
-				const rightBoundary = camera.x + contentWidth * camera.scale;
-				const ghostLeft =
-					columnInsertIndex === 0
-						? leftBoundary - ghostWidth
-						: columnInsertIndex === columnRects.length
-							? rightBoundary
-							: camera.x + columnRects[columnInsertIndex].x * camera.scale;
-				const lineLeft =
-					columnInsertIndex === 0
-						? leftBoundary
-						: columnInsertIndex === columnRects.length
-							? rightBoundary
-							: ghostLeft;
+				const ghostLeft = camera.x + columnRects[columnInsertIndex].x * camera.scale;
 				return {
-					lineLeft,
+					label: "Insert column",
+					title: draggedActiveTab?.title ?? "terminal",
+					tabCount: draggedPane.tabs.length,
+					preview: draggedPreview,
+					lineLeft: ghostLeft,
 					ghostLeft,
 					ghostWidth,
 					top: camera.y,
@@ -885,7 +835,8 @@ function OverviewCanvas({ layout, focusedPaneId, initialDrag, onConsumeInitialDr
 					const isSource = dragState?.sourcePaneId === paneRect.pane.id;
 					const dropPosition = hoverDrop?.targetPaneId === paneRect.pane.id ? hoverDrop.position : null;
 					const activeTab = paneRect.pane.tabs.find((tab) => tab.id === paneRect.pane.activeTabId) ?? paneRect.pane.tabs[0];
-					const preview = activeTab ? panePreviewByTabId.get(activeTab.id) ?? "No output yet" : "No output yet";
+					const snapshot = activeTab ? sessionManager.getSnapshot(activeTab.id) : "";
+					const preview = buildOverviewPreview(snapshot);
 					return (
 						<div
 							key={paneRect.pane.id}
@@ -945,7 +896,12 @@ function OverviewCanvas({ layout, focusedPaneId, initialDrag, onConsumeInitialDr
 							width: `${columnInsertPreview.ghostWidth}px`,
 							height: `${columnInsertPreview.height}px`,
 						}}
-					/>
+					>
+						<div className="overview-detach-ghost-pill">{columnInsertPreview.label}</div>
+						<div className="overview-detach-ghost-title">{columnInsertPreview.title}</div>
+						<div className="overview-detach-ghost-meta">{columnInsertPreview.tabCount} tab{columnInsertPreview.tabCount === 1 ? "" : "s"}</div>
+						<pre className="overview-detach-ghost-preview">{columnInsertPreview.preview}</pre>
+					</div>
 				</>
 			) : null}
 		</div>
@@ -957,8 +913,6 @@ interface WorkspaceViewProps {
 	accent: string;
 	theme: MosaicTheme;
 	focusMode: FocusMode;
-	visible: boolean;
-	overviewOpen: boolean;
 	fileTreeOpen: boolean;
 	fileTreeWidth: number;
 	onFileTreeWidthChange: (width: number) => void;
@@ -966,10 +920,10 @@ interface WorkspaceViewProps {
 	gitPaneWidth: number;
 	onGitPaneWidthChange: (width: number) => void;
 	onRefreshWorkspaceGit: () => Promise<void> | void;
+	overviewOpen: boolean;
 	focusedPaneId?: string;
 	onExitOverview: () => void;
 	onOpenOverview: () => void;
-	onCloseWorkspace: () => void;
 	onAddPane: () => void;
 	onAddBrowserPane: () => void;
 	onOpenFile: (filePath: string) => void;
@@ -980,13 +934,11 @@ interface WorkspaceViewProps {
 	onUpdateLayout: (layout: LayoutNode) => void;
 }
 
-export const WorkspaceView = memo(function WorkspaceView({
+export function WorkspaceView({
 	workspace,
 	accent,
 	theme,
 	focusMode,
-	visible,
-	overviewOpen,
 	fileTreeOpen,
 	fileTreeWidth,
 	onFileTreeWidthChange,
@@ -994,10 +946,10 @@ export const WorkspaceView = memo(function WorkspaceView({
 	gitPaneWidth,
 	onGitPaneWidthChange,
 	onRefreshWorkspaceGit,
+	overviewOpen,
 	focusedPaneId,
 	onExitOverview,
 	onOpenOverview,
-	onCloseWorkspace,
 	onAddPane,
 	onAddBrowserPane,
 	onOpenFile,
@@ -1014,7 +966,6 @@ export const WorkspaceView = memo(function WorkspaceView({
 	const [overviewSeedDrag, setOverviewSeedDrag] = useState<{ paneId: string; clientX: number; clientY: number } | null>(null);
 	const [middlePanning, setMiddlePanning] = useState(false);
 	const [newPaneMenuOpen, setNewPaneMenuOpen] = useState(false);
-	const [newPaneMenuPlacement, setNewPaneMenuPlacement] = useState<"up" | "down">("up");
 	const newPaneMenuRef = useRef<HTMLDivElement | null>(null);
 
 	const middlePanStateRef = useRef<null | {
@@ -1056,21 +1007,7 @@ export const WorkspaceView = memo(function WorkspaceView({
 	}, [workspace.id]);
 
 	useEffect(() => {
-		if (!visible) {
-			setNewPaneMenuOpen(false);
-			return;
-		}
 		if (!newPaneMenuOpen) return;
-
-		const updatePlacement = () => {
-			const anchor = newPaneMenuRef.current;
-			if (!anchor) return;
-			const rect = anchor.getBoundingClientRect();
-			const estimatedMenuHeight = 132;
-			const canOpenUp = rect.top >= estimatedMenuHeight + 12;
-			setNewPaneMenuPlacement(canOpenUp ? "up" : "down");
-		};
-
 		const handlePointerDown = (event: MouseEvent) => {
 			const menu = newPaneMenuRef.current;
 			if (!menu) return;
@@ -1080,17 +1017,13 @@ export const WorkspaceView = memo(function WorkspaceView({
 		const handleKeyDown = (event: KeyboardEvent) => {
 			if (event.key === "Escape") setNewPaneMenuOpen(false);
 		};
-
-		updatePlacement();
-		window.addEventListener("resize", updatePlacement);
 		window.addEventListener("mousedown", handlePointerDown);
 		window.addEventListener("keydown", handleKeyDown);
 		return () => {
-			window.removeEventListener("resize", updatePlacement);
 			window.removeEventListener("mousedown", handlePointerDown);
 			window.removeEventListener("keydown", handleKeyDown);
 		};
-	}, [newPaneMenuOpen, visible]);
+	}, [newPaneMenuOpen]);
 
 	useEffect(() => {
 		if (!zoomedPaneId) return;
@@ -1099,7 +1032,6 @@ export const WorkspaceView = memo(function WorkspaceView({
 	}, [workspace.layout, zoomedPaneId]);
 
 	useEffect(() => {
-		if (!visible) return;
 		const handleKeydown = (event: KeyboardEvent) => {
 			if (!(event.ctrlKey && event.shiftKey && !event.altKey && event.code === "KeyM")) return;
 			const target = event.target as HTMLElement | null;
@@ -1118,10 +1050,10 @@ export const WorkspaceView = memo(function WorkspaceView({
 
 		window.addEventListener("keydown", handleKeydown);
 		return () => window.removeEventListener("keydown", handleKeydown);
-	}, [focusedPaneId, visible, workspace.layout]);
+	}, [focusedPaneId, workspace.layout]);
 
 	useEffect(() => {
-		if (!visible || !focusedPaneId || overviewOpen) return;
+		if (!focusedPaneId || overviewOpen) return;
 		const container = layoutRootRef.current;
 		const paneElement = paneElementsRef.current.get(focusedPaneId);
 		if (!container || !paneElement) return;
@@ -1221,63 +1153,9 @@ export const WorkspaceView = memo(function WorkspaceView({
 		};
 	}, []);
 
-	const handleBeginFileTreeResize = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
-		event.preventDefault();
-		event.stopPropagation();
-		const startClientX = event.clientX;
-		const startWidth = fileTreeWidth;
-		const FILE_TREE_MIN_WIDTH = 180;
-		const FILE_TREE_MAX_WIDTH = 520;
-
-		const handleMove = (moveEvent: MouseEvent) => {
-			const delta = moveEvent.clientX - startClientX;
-			onFileTreeWidthChange(Math.min(FILE_TREE_MAX_WIDTH, Math.max(FILE_TREE_MIN_WIDTH, startWidth + delta)));
-		};
-
-		const handleUp = () => {
-			window.removeEventListener("mousemove", handleMove);
-			window.removeEventListener("mouseup", handleUp);
-			document.body.classList.remove("is-resizing");
-		};
-
-		document.body.classList.add("is-resizing");
-		window.addEventListener("mousemove", handleMove);
-		window.addEventListener("mouseup", handleUp);
-	}, [fileTreeWidth, onFileTreeWidthChange]);
-
-	const handleBeginGitPaneResize = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
-		event.preventDefault();
-		event.stopPropagation();
-		const startClientX = event.clientX;
-		const startWidth = gitPaneWidth;
-		const FILE_TREE_MIN_WIDTH = 180;
-		const FILE_TREE_MAX_WIDTH = 520;
-
-		const handleMove = (moveEvent: MouseEvent) => {
-			const delta = startClientX - moveEvent.clientX;
-			onGitPaneWidthChange(Math.min(FILE_TREE_MAX_WIDTH, Math.max(FILE_TREE_MIN_WIDTH, startWidth + delta)));
-		};
-
-		const handleUp = () => {
-			window.removeEventListener("mousemove", handleMove);
-			window.removeEventListener("mouseup", handleUp);
-			document.body.classList.remove("is-resizing");
-		};
-
-		document.body.classList.add("is-resizing");
-		window.addEventListener("mousemove", handleMove);
-		window.addEventListener("mouseup", handleUp);
-	}, [gitPaneWidth, onGitPaneWidthChange]);
-
 	const handleClosePane = useCallback(
 		(paneId: string) => {
-			const currentLayout = layoutRef.current;
-			if (countPanes(currentLayout) <= 1) {
-				onCloseWorkspace();
-				return;
-			}
-
-			const pane = findPaneById(currentLayout, paneId);
+			const pane = findPaneById(layoutRef.current, paneId);
 			if (pane) {
 				const dirtyEditors = pane.tabs.filter((tab) => (tab.kind === "editor" || tab.kind === "markdown") && tab.dirty);
 				if (dirtyEditors.length > 0) {
@@ -1291,7 +1169,7 @@ export const WorkspaceView = memo(function WorkspaceView({
 			applyLayout((layout) => removePane(layout, paneId) ?? layout);
 			setZoomedPaneId((current) => (current === paneId ? null : current));
 		},
-		[applyLayout, onCloseWorkspace, sessionManager],
+		[applyLayout, sessionManager],
 	);
 
 	const overviewWorldWidth = (Math.max(getLayoutWidthUnits(workspace.layout), WIDTH_UNIT_BASE) / WIDTH_UNIT_BASE) * 1100;
@@ -1388,21 +1266,69 @@ export const WorkspaceView = memo(function WorkspaceView({
 		[applyLayout, handleMoveTab, onFocusPane, workspace.path],
 	);
 
+	const handleBeginFileTreeResize = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+		event.preventDefault();
+		event.stopPropagation();
+		const startClientX = event.clientX;
+		const startWidth = fileTreeWidth;
+
+		const handleMove = (moveEvent: MouseEvent) => {
+			const delta = moveEvent.clientX - startClientX;
+			onFileTreeWidthChange(Math.min(FILE_TREE_MAX_WIDTH, Math.max(FILE_TREE_MIN_WIDTH, startWidth + delta)));
+		};
+
+		const handleUp = () => {
+			window.removeEventListener("mousemove", handleMove);
+			window.removeEventListener("mouseup", handleUp);
+			document.body.classList.remove("is-resizing");
+		};
+
+		document.body.classList.add("is-resizing");
+		window.addEventListener("mousemove", handleMove);
+		window.addEventListener("mouseup", handleUp);
+	}, [fileTreeWidth, onFileTreeWidthChange]);
+
+	const handleBeginGitPaneResize = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+		event.preventDefault();
+		event.stopPropagation();
+		const startClientX = event.clientX;
+		const startWidth = gitPaneWidth;
+
+		const handleMove = (moveEvent: MouseEvent) => {
+			const delta = startClientX - moveEvent.clientX;
+			onGitPaneWidthChange(Math.min(FILE_TREE_MAX_WIDTH, Math.max(FILE_TREE_MIN_WIDTH, startWidth + delta)));
+		};
+
+		const handleUp = () => {
+			window.removeEventListener("mousemove", handleMove);
+			window.removeEventListener("mouseup", handleUp);
+			document.body.classList.remove("is-resizing");
+		};
+
+		document.body.classList.add("is-resizing");
+		window.addEventListener("mousemove", handleMove);
+		window.addEventListener("mouseup", handleUp);
+	}, [gitPaneWidth, onGitPaneWidthChange]);
+
 	const handleCloseTab = useCallback(
 		(paneId: string, tabId: string) => {
 			const pane = findPaneById(layoutRef.current, paneId);
 			const tab = pane?.tabs.find((item) => item.id === tabId);
-			if (!tab) return;
+			if (!tab || !pane) return;
 			if ((tab.kind === "editor" || tab.kind === "markdown") && tab.dirty) {
 				const shouldClose = window.confirm(`Discard unsaved changes in ${tab.title}?`);
 				if (!shouldClose) return;
+			}
+			if (pane.tabs.length <= 1) {
+				handleClosePane(paneId);
+				return;
 			}
 			if (isTerminalTab(tab)) {
 				sessionManager.closeSession(tab.id);
 			}
 			applyLayout((layout) => closeTab(layout, paneId, tabId, workspace.path));
 		},
-		[applyLayout, sessionManager, workspace.path],
+		[applyLayout, handleClosePane, sessionManager, workspace.path],
 	);
 
 	const handleBeginPaneShiftDrag = useCallback(
@@ -1487,119 +1413,125 @@ export const WorkspaceView = memo(function WorkspaceView({
 						/>
 					</aside>
 				) : null}
-				<div className="workspace-canvas-shell">
+				<div
+					className="workspace-canvas-shell"
+					style={{
+						...(fileTreeOpen ? { transform: `translateX(${fileTreeWidth}px)` } : {}),
+						...(gitPaneOpen ? { paddingRight: `${gitPaneWidth}px` } : {}),
+					}}
+				>
 					<div
 						ref={layoutRootRef}
 						className={`layout-root ${overviewOpen ? "overview-open" : ""} ${middlePanning ? "middle-panning" : ""}`}
-				onMouseDownCapture={(event) => {
-					if (overviewOpen) return;
-					if (event.button !== 1) return;
-					event.preventDefault();
-					event.stopPropagation();
-					const container = layoutRootRef.current;
-					if (!container) return;
-					if (middlePanMomentumRafRef.current !== null) {
-						window.cancelAnimationFrame(middlePanMomentumRafRef.current);
-						middlePanMomentumRafRef.current = null;
-					}
-					middlePanVelocityRef.current = { x: 0, y: 0 };
-					middlePanLastMoveRef.current = { x: event.clientX, y: event.clientY, time: performance.now() };
-					middlePanStateRef.current = {
-						startClientX: event.clientX,
-						startClientY: event.clientY,
-						originScrollLeft: container.scrollLeft,
-						originScrollTop: container.scrollTop,
-					};
-					setMiddlePanning(true);
-				}}
-				onAuxClick={(event) => {
-					if (event.button === 1) {
-						event.preventDefault();
-					}
-				}}
-			>
-				{overviewOpen ? (
-					<OverviewCanvas
-						layout={workspace.layout}
-						focusedPaneId={focusedPaneId}
-						initialDrag={overviewSeedDrag}
-						onConsumeInitialDrag={() => setOverviewSeedDrag(null)}
-						onFocusPane={onFocusPane}
-						onMovePane={handleOverviewMovePane}
-						onInsertColumn={handleMovePaneToColumn}
-						onClosePane={handleClosePane}
-						onExitOverview={onExitOverview}
-					/>
-				) : null}
-				<div
-					className="layout-canvas"
-					style={{
-						width: zoomedPane ? "100%" : `${(Math.max(getLayoutWidthUnits(workspace.layout), WIDTH_UNIT_BASE) / WIDTH_UNIT_BASE) * 100}%`,
-						minWidth: "100%",
-						display: overviewOpen ? "none" : undefined,
-					}}
-				>
-						{zoomedPane ? (
-							<div className="layout-leaf pane-zoom-shell">
-								<TerminalPane
-									pane={zoomedPane}
-									accent={accent}
-									theme={theme}
-									cwd={workspace.path}
-									focused
-									zoomed
-									onFocus={() => onFocusPane(zoomedPane.id)}
-									onMoveToNewColumn={() => handleMovePaneToNewColumn(zoomedPane.id)}
-									canMoveToNewColumn={canMovePaneToNewColumn(zoomedPane.id)}
-									onSplitVertical={() => onSplitPane(zoomedPane.id, "vertical")}
-									onSplitHorizontal={() => onSplitPane(zoomedPane.id, "horizontal")}
-									onClose={() => handleClosePane(zoomedPane.id)}
-									onAddTab={() => applyLayout((layout) => addTabToPane(layout, zoomedPane.id, workspace.path))}
-									onAddBrowserTab={() => applyLayout((layout) => addBrowserTabToPane(layout, zoomedPane.id))}
-									onSelectTab={(tabId) => applyLayout((layout) => setActiveTab(layout, zoomedPane.id, tabId))}
-									onCloseTab={(tabId) => handleCloseTab(zoomedPane.id, tabId)}
-									onMoveTab={handleMoveTab}
-									onDropTabToPane={(sourcePaneId, tabId, position) => handleDropTabToPane(sourcePaneId, tabId, zoomedPane.id, position)}
-									onToggleZoom={() => handleTogglePaneZoom(zoomedPane.id)}
-									onBeginShiftDrag={(clientX, clientY) => handleBeginPaneShiftDrag(zoomedPane.id, clientX, clientY)}
-									onUpdateTabMeta={(tabId, patch) => applyLayout((layout) => updateTabMeta(layout, zoomedPane.id, tabId, patch))}
-									onOpenFile={onOpenFile}
-									onUpdateTab={(tabId, updater) => onUpdateTab(zoomedPane.id, tabId, updater)}
-								/>
-							</div>
-						) : (
-							<LayoutView
-								node={workspace.layout}
-								accent={accent}
-								theme={theme}
-								cwd={workspace.path}
+						onMouseDownCapture={(event) => {
+							if (overviewOpen) return;
+							if (event.button !== 1) return;
+							event.preventDefault();
+							event.stopPropagation();
+							const container = layoutRootRef.current;
+							if (!container) return;
+							if (middlePanMomentumRafRef.current !== null) {
+								window.cancelAnimationFrame(middlePanMomentumRafRef.current);
+								middlePanMomentumRafRef.current = null;
+							}
+							middlePanVelocityRef.current = { x: 0, y: 0 };
+							middlePanLastMoveRef.current = { x: event.clientX, y: event.clientY, time: performance.now() };
+							middlePanStateRef.current = {
+								startClientX: event.clientX,
+								startClientY: event.clientY,
+								originScrollLeft: container.scrollLeft,
+								originScrollTop: container.scrollTop,
+							};
+							setMiddlePanning(true);
+						}}
+						onAuxClick={(event) => {
+							if (event.button === 1) {
+								event.preventDefault();
+							}
+						}}
+					>
+						{overviewOpen ? (
+							<OverviewCanvas
+								layout={workspace.layout}
 								focusedPaneId={focusedPaneId}
-								zoomedPaneId={zoomedPaneId}
+								initialDrag={overviewSeedDrag}
+								onConsumeInitialDrag={() => setOverviewSeedDrag(null)}
 								onFocusPane={onFocusPane}
-								onSplit={(paneId, direction) => onSplitPane(paneId, direction)}
-								onMovePaneToNewColumn={handleMovePaneToNewColumn}
-								canMovePaneToNewColumn={canMovePaneToNewColumn}
+								onMovePane={handleOverviewMovePane}
+								onInsertColumn={handleMovePaneToColumn}
 								onClosePane={handleClosePane}
-								onAddTab={(paneId) => applyLayout((layout) => addTabToPane(layout, paneId, workspace.path))}
-								onAddBrowserTab={(paneId) => applyLayout((layout) => addBrowserTabToPane(layout, paneId))}
-								onSelectTab={(paneId, tabId) => applyLayout((layout) => setActiveTab(layout, paneId, tabId))}
-								onCloseTab={handleCloseTab}
-								onMoveTab={handleMoveTab}
-								onDropTabToPane={handleDropTabToPane}
-								onTogglePaneZoom={handleTogglePaneZoom}
-								onBeginPaneShiftDrag={handleBeginPaneShiftDrag}
-								onResizeHorizontalSplit={(splitId, ratio) => applyLayout((layout) => updateSplitRatio(layout, splitId, ratio))}
-								onResizeVerticalSplitBranch={(splitId, branch, deltaRatio) =>
-									applyLayout((layout) => resizeVerticalSplitByDelta(layout, splitId, deltaRatio, branch))
-								}
-								onRegisterPaneElement={registerPaneElement}
-								onUpdateTabMeta={(paneId, tabId, patch) => applyLayout((layout) => updateTabMeta(layout, paneId, tabId, patch))}
-								onOpenFile={(filePath) => onOpenFile(filePath)}
-								onUpdateTab={onUpdateTab}
+								onExitOverview={onExitOverview}
 							/>
+						) : (
+							<div
+								className="layout-canvas"
+								style={{
+									width: zoomedPane ? "100%" : `${(Math.max(getLayoutWidthUnits(workspace.layout), WIDTH_UNIT_BASE) / WIDTH_UNIT_BASE) * 100}%`,
+									minWidth: "100%",
+								}}
+							>
+								{zoomedPane ? (
+									<div className="layout-leaf pane-zoom-shell">
+										<TerminalPane
+											pane={zoomedPane}
+											accent={accent}
+											theme={theme}
+											cwd={workspace.path}
+											focused
+											zoomed
+											onFocus={() => onFocusPane(zoomedPane.id)}
+											onMoveToNewColumn={() => handleMovePaneToNewColumn(zoomedPane.id)}
+											canMoveToNewColumn={canMovePaneToNewColumn(zoomedPane.id)}
+											onSplitVertical={() => onSplitPane(zoomedPane.id, "vertical")}
+											onSplitHorizontal={() => onSplitPane(zoomedPane.id, "horizontal")}
+											onClose={() => handleClosePane(zoomedPane.id)}
+											onAddTab={() => applyLayout((layout) => addTabToPane(layout, zoomedPane.id, workspace.path))}
+											onAddBrowserTab={() => applyLayout((layout) => addBrowserTabToPane(layout, zoomedPane.id))}
+											onSelectTab={(tabId) => applyLayout((layout) => setActiveTab(layout, zoomedPane.id, tabId))}
+											onCloseTab={(tabId) => handleCloseTab(zoomedPane.id, tabId)}
+											onMoveTab={handleMoveTab}
+											onDropTabToPane={(sourcePaneId, tabId, position) => handleDropTabToPane(sourcePaneId, tabId, zoomedPane.id, position)}
+											onToggleZoom={() => handleTogglePaneZoom(zoomedPane.id)}
+											onBeginShiftDrag={(clientX, clientY) => handleBeginPaneShiftDrag(zoomedPane.id, clientX, clientY)}
+											onUpdateTabMeta={(tabId, patch) => applyLayout((layout) => updateTabMeta(layout, zoomedPane.id, tabId, patch))}
+											onOpenFile={onOpenFile}
+											onUpdateTab={(tabId, updater) => onUpdateTab(zoomedPane.id, tabId, updater)}
+										/>
+									</div>
+								) : (
+									<LayoutView
+										node={workspace.layout}
+										accent={accent}
+										theme={theme}
+										cwd={workspace.path}
+										focusedPaneId={focusedPaneId}
+										zoomedPaneId={zoomedPaneId}
+										onFocusPane={onFocusPane}
+										onSplit={(paneId, direction) => onSplitPane(paneId, direction)}
+										onMovePaneToNewColumn={handleMovePaneToNewColumn}
+										canMovePaneToNewColumn={canMovePaneToNewColumn}
+										onClosePane={handleClosePane}
+										onAddTab={(paneId) => applyLayout((layout) => addTabToPane(layout, paneId, workspace.path))}
+										onAddBrowserTab={(paneId) => applyLayout((layout) => addBrowserTabToPane(layout, paneId))}
+										onSelectTab={(paneId, tabId) => applyLayout((layout) => setActiveTab(layout, paneId, tabId))}
+										onCloseTab={handleCloseTab}
+										onMoveTab={handleMoveTab}
+										onDropTabToPane={handleDropTabToPane}
+										onTogglePaneZoom={handleTogglePaneZoom}
+										onBeginPaneShiftDrag={handleBeginPaneShiftDrag}
+										onResizeHorizontalSplit={(splitId, ratio) => applyLayout((layout) => updateSplitRatio(layout, splitId, ratio))}
+										onResizeVerticalSplitBranch={(splitId, branch, deltaRatio) =>
+											applyLayout((layout) => resizeVerticalSplitByDelta(layout, splitId, deltaRatio, branch))
+										}
+										onRegisterPaneElement={registerPaneElement}
+										onUpdateTabMeta={(paneId, tabId, patch) => applyLayout((layout) => updateTabMeta(layout, paneId, tabId, patch))}
+										onOpenFile={(filePath) => onOpenFile(filePath)}
+										onUpdateTab={onUpdateTab}
+									/>
+								)}
+							</div>
 						)}
 					</div>
-				</div>
 				</div>
 				{gitPaneOpen ? (
 					<aside className="workspace-git-dock" style={{ width: `${gitPaneWidth}px` }}>
@@ -1617,7 +1549,7 @@ export const WorkspaceView = memo(function WorkspaceView({
 				<div className="workspace-corner-controls">
 					<button
 						type="button"
-						className={`icon-button workspace-corner-overview ${overviewOpen ? "active" : ""}`}
+						className={`icon-button ${overviewOpen ? "active" : ""}`}
 						onClick={overviewOpen ? onExitOverview : onOpenOverview}
 						aria-label={overviewOpen ? "Exit overview" : "Open overview"}
 					>
@@ -1625,7 +1557,7 @@ export const WorkspaceView = memo(function WorkspaceView({
 					</button>
 					<div className="new-pane-menu-wrap" ref={newPaneMenuRef}>
 						{newPaneMenuOpen ? (
-							<div className={`new-pane-menu ${newPaneMenuPlacement === "down" ? "open-down" : "open-up"}`} role="menu" aria-label="Choose pane type">
+							<div className="new-pane-menu" role="menu" aria-label="Choose pane type">
 								<button
 									type="button"
 									className="new-pane-menu-item"
@@ -1674,11 +1606,11 @@ export const WorkspaceView = memo(function WorkspaceView({
 										key={rect.pane.id}
 										className={`pane-minimap-pane ${focusedPaneId === rect.pane.id ? "active" : ""}`}
 										style={{
-										left: `${(rect.x / minimapWorldWidth) * 100}%`,
-										top: `${(rect.y / minimapWorldHeight) * 100}%`,
-										width: `${(rect.width / minimapWorldWidth) * 100}%`,
-										height: `${(rect.height / minimapWorldHeight) * 100}%`,
-									}}
+											left: `${(rect.x / minimapWorldWidth) * 100}%`,
+											top: `${(rect.y / minimapWorldHeight) * 100}%`,
+											width: `${(rect.width / minimapWorldWidth) * 100}%`,
+											height: `${(rect.height / minimapWorldHeight) * 100}%`,
+										}}
 										onClick={() => focusPaneFromMap(rect.pane.id)}
 										onKeyDown={(event) => {
 											if (event.key === "Enter" || event.key === " ") {
@@ -1699,4 +1631,4 @@ export const WorkspaceView = memo(function WorkspaceView({
 			</div>
 		</div>
 	);
-});
+}

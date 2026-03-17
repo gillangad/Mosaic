@@ -1,11 +1,13 @@
-import { AnimatePresence, Reorder, useDragControls } from "framer-motion";
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent } from "react";
+import { AnimatePresence, motion, Reorder, useDragControls } from "framer-motion";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent as ReactDragEvent } from "react";
 import { createPortal } from "react-dom";
 import { WorkspaceView } from "./WorkspaceView";
+import { FileTreeSidebar } from "./components/FileTreeSidebar";
 import {
 	addTabToPane,
 	appendPaneToRight,
 	closeTab,
+	countPanes,
 	createPaneNode,
 	findAdjacentPaneId,
 	findFirstPaneId,
@@ -14,6 +16,7 @@ import {
 	findTabByFilePath,
 	getAllTabIds,
 	moveColumnContainingPane,
+	removePane,
 	rehydrateLayout,
 	replacePaneTabs,
 	resizeFromPane,
@@ -46,11 +49,6 @@ type ThemeId = keyof typeof themes;
 type FocusMode = "default" | "center" | "edge";
 type SettingsView = "root" | "skins" | "shortcuts";
 
-interface ShortcutDefinition {
-	action: string;
-	keys: string;
-}
-
 interface CommandAction {
 	id: string;
 	label: string;
@@ -68,6 +66,7 @@ const STORAGE_KEYS = {
 	fileTreeWidth: "mosaic.fileTreeWidth",
 	gitPaneCollapsed: "mosaic.gitPaneCollapsed",
 	gitPaneWidth: "mosaic.gitPaneWidth",
+	hotkeys: "mosaic.hotkeys",
 	workspaces: "mosaic.workspaces",
 } as const;
 
@@ -78,31 +77,101 @@ const LEGACY_THEME_IDS: Record<string, ThemeId> = {
 	ink: "carbon",
 };
 
-const SHORTCUTS: ShortcutDefinition[] = [
-	{ action: "Open workspace", keys: "Ctrl Shift O" },
-	{ action: "New pane", keys: "Ctrl Shift Enter" },
-	{ action: "Split pane vertically", keys: "Ctrl Shift Alt %" },
-	{ action: "Split pane horizontally", keys: 'Ctrl Shift Alt "' },
-	{ action: "New tab", keys: "Ctrl Shift T" },
-	{ action: "Close tab", keys: "Ctrl Shift W" },
-	{ action: "Next tab", keys: "Ctrl Tab" },
-	{ action: "Previous tab", keys: "Ctrl Shift Tab" },
-	{ action: "Focus pane", keys: "Ctrl Arrow" },
-	{ action: "Move column", keys: "Shift Left / Right" },
-	{ action: "Move pane with mouse", keys: "Shift Drag" },
-	{ action: "Resize pane", keys: "Ctrl Alt Arrow" },
-	{ action: "Toggle pane zoom", keys: "Ctrl Shift M" },
-	{ action: "Previous workspace", keys: "Alt Shift Left / Up" },
-	{ action: "Next workspace", keys: "Alt Shift Right / Down" },
-	{ action: "Open settings", keys: "Ctrl ," },
-	{ action: "Command palette", keys: "Ctrl K" },
+type HotkeyActionId =
+	| "openWorkspace"
+	| "newPane"
+	| "splitVertical"
+	| "splitHorizontal"
+	| "newTab"
+	| "closeTab"
+	| "nextTab"
+	| "prevTab"
+	| "focusLeft"
+	| "focusRight"
+	| "focusUp"
+	| "focusDown"
+	| "resizeLeft"
+	| "resizeRight"
+	| "resizeUp"
+	| "resizeDown"
+	| "previousWorkspace"
+	| "nextWorkspace"
+	| "openSettings"
+	| "commandPalette";
+
+const HOTKEY_DEFAULTS: Record<HotkeyActionId, string> = {
+	openWorkspace: "Ctrl+Shift+KeyO",
+	newPane: "Ctrl+Shift+Enter",
+	splitVertical: "Ctrl+Shift+Alt+Digit5",
+	splitHorizontal: "Ctrl+Shift+Alt+Quote",
+	newTab: "Ctrl+Shift+KeyT",
+	closeTab: "Ctrl+Shift+KeyW",
+	nextTab: "Ctrl+Tab",
+	prevTab: "Ctrl+Shift+Tab",
+	focusLeft: "Ctrl+ArrowLeft",
+	focusRight: "Ctrl+ArrowRight",
+	focusUp: "Ctrl+ArrowUp",
+	focusDown: "Ctrl+ArrowDown",
+	resizeLeft: "Ctrl+Alt+ArrowLeft",
+	resizeRight: "Ctrl+Alt+ArrowRight",
+	resizeUp: "Ctrl+Alt+ArrowUp",
+	resizeDown: "Ctrl+Alt+ArrowDown",
+	previousWorkspace: "Alt+Shift+ArrowLeft",
+	nextWorkspace: "Alt+Shift+ArrowRight",
+	openSettings: "Ctrl+Comma",
+	commandPalette: "Ctrl+KeyK",
+};
+
+const HOTKEY_LABELS: Record<HotkeyActionId, string> = {
+	openWorkspace: "Open workspace",
+	newPane: "New pane",
+	splitVertical: "Split pane vertically",
+	splitHorizontal: "Split pane horizontally",
+	newTab: "New tab",
+	closeTab: "Close tab",
+	nextTab: "Next tab",
+	prevTab: "Previous tab",
+	focusLeft: "Focus pane left",
+	focusRight: "Focus pane right",
+	focusUp: "Focus pane up",
+	focusDown: "Focus pane down",
+	resizeLeft: "Resize pane left",
+	resizeRight: "Resize pane right",
+	resizeUp: "Resize pane up",
+	resizeDown: "Resize pane down",
+	previousWorkspace: "Previous workspace",
+	nextWorkspace: "Next workspace",
+	openSettings: "Open settings",
+	commandPalette: "Command palette",
+};
+
+const HOTKEY_ORDER: HotkeyActionId[] = [
+	"openWorkspace",
+	"newPane",
+	"splitVertical",
+	"splitHorizontal",
+	"newTab",
+	"closeTab",
+	"nextTab",
+	"prevTab",
+	"focusLeft",
+	"focusRight",
+	"focusUp",
+	"focusDown",
+	"resizeLeft",
+	"resizeRight",
+	"resizeUp",
+	"resizeDown",
+	"previousWorkspace",
+	"nextWorkspace",
+	"openSettings",
+	"commandPalette",
 ];
 
 const GIT_POLL_INTERVAL_MS = 30_000;
 const FILE_TREE_MIN_WIDTH = 180;
 const FILE_TREE_MAX_WIDTH = 520;
 const FILE_TREE_DEFAULT_WIDTH = 270;
-const MAX_INLINE_TEXT_FILE_BYTES = 512_000;
 
 function fuzzyScore(value: string, query: string) {
 	const source = value.toLowerCase();
@@ -179,7 +248,15 @@ function CommandPalette({ open, actions, onClose }: { open: boolean; actions: Co
 			{open ? (
 				<>
 					<button type="button" className="command-palette-scrim" onMouseDown={onClose} aria-label="Close command palette" />
-					<div className="command-palette" role="dialog" aria-label="Command palette">
+					<motion.div
+						className="command-palette"
+						initial={{ opacity: 0 }}
+						animate={{ opacity: 1 }}
+						exit={{ opacity: 0 }}
+						transition={{ duration: 0.16, ease: [0.22, 1, 0.36, 1] }}
+						role="dialog"
+						aria-label="Command palette"
+					>
 						<input
 							ref={inputRef}
 							type="text"
@@ -231,7 +308,7 @@ function CommandPalette({ open, actions, onClose }: { open: boolean; actions: Co
 								</button>
 							))}
 						</div>
-					</div>
+					</motion.div>
 				</>
 			) : null}
 		</AnimatePresence>,
@@ -245,6 +322,41 @@ function clampNumber(value: number, min: number, max: number) {
 
 function normalizeWorkspacePath(value: string) {
 	return value.replace(/[\\/]+$/, "");
+}
+
+function serializeHotkey(event: KeyboardEvent) {
+	const parts: string[] = [];
+	if (event.ctrlKey || event.metaKey) parts.push("Ctrl");
+	if (event.altKey) parts.push("Alt");
+	if (event.shiftKey) parts.push("Shift");
+	const code = event.code === "Space" ? "Space" : event.code || event.key;
+	parts.push(code);
+	return parts.join("+");
+}
+
+function displayHotkey(binding: string) {
+	return binding
+		.replace(/\+/g, " ")
+		.replace(/Key/g, "")
+		.replace(/Digit/g, "")
+		.replace(/Arrow/g, "Arrow ")
+		.replace(/\s+/g, " ")
+		.trim();
+}
+
+function readStoredHotkeys() {
+	if (typeof window === "undefined") return HOTKEY_DEFAULTS;
+	const raw = window.localStorage.getItem(STORAGE_KEYS.hotkeys);
+	if (!raw) return HOTKEY_DEFAULTS;
+	try {
+		const parsed = JSON.parse(raw) as Partial<Record<HotkeyActionId, string>>;
+		return {
+			...HOTKEY_DEFAULTS,
+			...parsed,
+		};
+	} catch {
+		return HOTKEY_DEFAULTS;
+	}
 }
 
 function countBusyTabs(node: LayoutNode): number {
@@ -305,17 +417,16 @@ function getCanvasSurface(_theme: MosaicTheme) {
 	return "#111317";
 }
 
-function getCanvasBorder(theme: MosaicTheme) {
-	return theme.kind === "light"
-		? `color-mix(in srgb, ${theme.borderDim} 80%, ${theme.textPrimary} 4%)`
-		: `color-mix(in srgb, ${theme.borderDim} 70%, transparent)`;
+function getCanvasBorder(_theme: MosaicTheme) {
+	return "#111317";
 }
 
 function buildThemeVars(theme: MosaicTheme) {
+	const shellSurface = "#0B0B0E";
 	return {
-		["--bg-void" as string]: theme.bgVoid,
-		["--bg-surface" as string]: theme.bgSurface,
-		["--bg-well" as string]: theme.bgWell,
+		["--bg-void" as string]: shellSurface,
+		["--bg-surface" as string]: shellSurface,
+		["--bg-well" as string]: shellSurface,
 		["--border-dim" as string]: theme.borderDim,
 		["--border-glow" as string]: theme.borderGlow,
 		["--text-primary" as string]: theme.textPrimary,
@@ -329,9 +440,7 @@ function buildThemeVars(theme: MosaicTheme) {
 		["--surface-tint" as string]: theme.kind === "light" ? "rgba(255, 255, 255, 0.8)" : `color-mix(in srgb, ${theme.bgSurface} 80%, transparent)`,
 		["--rail-tint" as string]: theme.kind === "light" ? "rgba(250, 250, 250, 0.5)" : `color-mix(in srgb, ${theme.bgSurface} 50%, transparent)`,
 		["--tab-active-bg" as string]: theme.kind === "light" ? "rgba(0, 0, 0, 0.03)" : "rgba(255, 255, 255, 0.03)",
-		["--bg-elevated" as string]: theme.kind === "light"
-			? `color-mix(in srgb, ${theme.bgSurface} 97%, ${theme.textPrimary})`
-			: `color-mix(in srgb, ${theme.bgSurface} 85%, ${theme.textPrimary})`,
+		["--bg-elevated" as string]: shellSurface,
 		["--canvas-surface" as string]: getCanvasSurface(theme),
 		["--canvas-border" as string]: getCanvasBorder(theme),
 	};
@@ -375,21 +484,39 @@ function GitPaneToggleIcon() {
 	);
 }
 
-function NotificationBellIcon() {
+function FloatingFileTreePane({
+	rootPath,
+	onOpenFile,
+	onClose,
+	style,
+}: {
+	rootPath: string;
+	onOpenFile: (filePath: string) => void;
+	onClose: () => void;
+	style: CSSProperties;
+}) {
 	return (
-		<svg className="file-tree-toggle-icon" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-			<path d="M8 2.7a3.4 3.4 0 0 0-3.4 3.4v2.3c0 .8-.24 1.57-.7 2.22l-.7.98h9.6l-.7-.98a3.8 3.8 0 0 1-.7-2.22V6.1A3.4 3.4 0 0 0 8 2.7Z" stroke="currentColor" strokeWidth="1.1" strokeLinejoin="round" />
-			<path d="M6.3 12.2a1.7 1.7 0 0 0 3.4 0" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" />
-		</svg>
-	);
-}
-
-function SettingsIcon() {
-	return (
-		<svg className="file-tree-toggle-icon" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-			<circle cx="8" cy="8" r="2.2" stroke="currentColor" strokeWidth="1.1" />
-			<path d="M8 1.9v1.5M8 12.6v1.5M3.4 3.4l1.1 1.1M11.5 11.5l1.1 1.1M1.9 8h1.5M12.6 8h1.5M3.4 12.6l1.1-1.1M11.5 4.5l1.1-1.1" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" />
-		</svg>
+		<section className="terminal-pane file-tree-floating-pane" style={style}>
+			<div className="terminal-pane-accent" />
+			<div className="pane-header pane-header-tabs file-tree-floating-header">
+				<div className="pane-tab-strip">
+					<button type="button" className="pane-tab-button active file-tree-floating-tab" aria-label="Files">
+						<span className="status-dot pane-tab-status status-idle" />
+						<span className="pane-tab-title">Files</span>
+					</button>
+				</div>
+				<div className="pane-actions">
+					<div className="pane-action-slot" data-tooltip="Close file tree">
+						<button type="button" className="pane-close-button" onClick={onClose} aria-label="Close file tree">
+							×
+						</button>
+					</div>
+				</div>
+			</div>
+			<div className="pane-body">
+				<FileTreeSidebar rootPath={rootPath} onOpenFile={onOpenFile} />
+			</div>
+		</section>
 	);
 }
 
@@ -521,10 +648,6 @@ function WorkspaceTabItem({
 			className={`workspace-tab ${isActive ? "active" : ""} ${isRenaming ? "renaming" : ""}`}
 			data-workspace-tab-id={workspace.id}
 			style={{ ["--workspace-accent" as string]: accent }}
-			onClick={() => {
-				if (isRenaming || isDraggingRef.current) return;
-				onSelect();
-			}}
 			onDragStart={() => {
 				if (isRenaming) return;
 				isDraggingRef.current = true;
@@ -643,170 +766,19 @@ function WorkspaceTabItem({
 			>
 				×
 			</button>
+			{isActive ? (
+				<motion.div
+					layoutId="tab-indicator"
+					className="workspace-tab-indicator"
+					initial={{ opacity: 0 }}
+					animate={{ opacity: 1 }}
+					exit={{ opacity: 0 }}
+					transition={{ type: "spring", stiffness: 250, damping: 28, opacity: { duration: 0.18 } }}
+				/>
+			) : null}
 		</Reorder.Item>
 	);
 }
-
-interface WorkspacePanelProps {
-	workspace: WorkspaceModel;
-	accent: string;
-	theme: MosaicTheme;
-	visible: boolean;
-	overviewOpen: boolean;
-	fileTreeOpen: boolean;
-	fileTreeWidth: number;
-	onFileTreeWidthChange: (width: number) => void;
-	gitPaneOpen: boolean;
-	gitPaneWidth: number;
-	onGitPaneWidthChange: (width: number) => void;
-	onRefreshWorkspaceGit: (workspaceId: string) => Promise<void> | void;
-	onExitOverview: () => void;
-	onOpenOverview: () => void;
-	onOpenFileFromTree: (workspaceId: string, filePath: string) => Promise<void> | void;
-	onUpdateWorkspaceTab: (workspaceId: string, paneId: string, tabId: string, updater: (tab: PaneTabModel) => PaneTabModel) => void;
-	onFocusWorkspacePane: (workspaceId: string, paneId: string) => void;
-	onUpdateWorkspace: (workspaceId: string, updater: (workspace: WorkspaceModel) => WorkspaceModel) => void;
-	onRemoveWorkspace: (workspaceId: string) => void;
-}
-
-const WorkspacePanel = memo(function WorkspacePanel({
-	workspace,
-	accent,
-	theme,
-	visible,
-	overviewOpen,
-	fileTreeOpen,
-	fileTreeWidth,
-	onFileTreeWidthChange,
-	gitPaneOpen,
-	gitPaneWidth,
-	onGitPaneWidthChange,
-	onRefreshWorkspaceGit,
-	onExitOverview,
-	onOpenOverview,
-	onOpenFileFromTree,
-	onUpdateWorkspaceTab,
-	onFocusWorkspacePane,
-	onUpdateWorkspace,
-	onRemoveWorkspace,
-}: WorkspacePanelProps) {
-	const handleAddPane = useCallback(() => {
-		onUpdateWorkspace(workspace.id, (current) => {
-			const nextLayout = appendPaneToRight(current.layout, current.path);
-			const insertedPaneId = findLastPaneId(nextLayout);
-			return {
-				...current,
-				layout: nextLayout,
-				focusedPaneId: insertedPaneId,
-			};
-		});
-	}, [onUpdateWorkspace, workspace.id]);
-
-	const handleAddBrowserPane = useCallback(() => {
-		onUpdateWorkspace(workspace.id, (current) => {
-			const nextLayout = appendPaneToRight(current.layout, current.path);
-			const insertedPaneId = findLastPaneId(nextLayout);
-			const browserTab = createBrowserTab("about:blank");
-			const layoutWithBrowser = replacePaneTabs(nextLayout, insertedPaneId, [browserTab], browserTab.id);
-			return {
-				...current,
-				layout: layoutWithBrowser,
-				focusedPaneId: insertedPaneId,
-			};
-		});
-	}, [onUpdateWorkspace, workspace.id]);
-
-	const handleOpenFile = useCallback((filePath: string) => {
-		void onOpenFileFromTree(workspace.id, filePath);
-	}, [onOpenFileFromTree, workspace.id]);
-
-	const handleUpdateTab = useCallback(
-		(paneId: string, tabId: string, updater: (tab: PaneTabModel) => PaneTabModel) => {
-			onUpdateWorkspaceTab(workspace.id, paneId, tabId, updater);
-		},
-		[onUpdateWorkspaceTab, workspace.id],
-	);
-
-	const handleFocusPane = useCallback((paneId: string) => {
-		onFocusWorkspacePane(workspace.id, paneId);
-	}, [onFocusWorkspacePane, workspace.id]);
-
-	const handleSwapPanes = useCallback(
-		(sourcePaneId: string, targetPaneId: string) => {
-			onUpdateWorkspace(workspace.id, (current) => ({
-				...current,
-				layout: swapPanes(current.layout, sourcePaneId, targetPaneId),
-				focusedPaneId: sourcePaneId,
-			}));
-		},
-		[onUpdateWorkspace, workspace.id],
-	);
-
-	const handleSplitPane = useCallback(
-		(paneId: string, direction: "vertical" | "horizontal") => {
-			onUpdateWorkspace(workspace.id, (current) => ({
-				...current,
-				layout: splitNode(current.layout, paneId, direction, current.path),
-				focusedPaneId: paneId,
-			}));
-		},
-		[onUpdateWorkspace, workspace.id],
-	);
-
-	const handleUpdateLayout = useCallback(
-		(layout: LayoutNode) => {
-			onUpdateWorkspace(workspace.id, (current) => ({
-				...current,
-				layout,
-				focusedPaneId:
-					current.focusedPaneId && findPaneById(layout, current.focusedPaneId)
-						? current.focusedPaneId
-						: findFirstPaneId(layout),
-			}));
-		},
-		[onUpdateWorkspace, workspace.id],
-	);
-
-	const handleRefreshWorkspaceGit = useCallback(() => {
-		void onRefreshWorkspaceGit(workspace.id);
-	}, [onRefreshWorkspaceGit, workspace.id]);
-
-	const handleCloseWorkspace = useCallback(() => {
-		onRemoveWorkspace(workspace.id);
-	}, [onRemoveWorkspace, workspace.id]);
-
-	return (
-		<div className={`workspace-panel ${visible ? "active" : "inactive"}`} aria-hidden={!visible}>
-			<WorkspaceView
-				workspace={workspace}
-				accent={accent}
-				theme={theme}
-				focusMode="center"
-				visible={visible}
-				overviewOpen={overviewOpen}
-				fileTreeOpen={fileTreeOpen}
-				fileTreeWidth={fileTreeWidth}
-				onFileTreeWidthChange={onFileTreeWidthChange}
-				gitPaneOpen={gitPaneOpen}
-				gitPaneWidth={gitPaneWidth}
-				onGitPaneWidthChange={onGitPaneWidthChange}
-				onRefreshWorkspaceGit={handleRefreshWorkspaceGit}
-				onExitOverview={onExitOverview}
-				onOpenOverview={onOpenOverview}
-				onCloseWorkspace={handleCloseWorkspace}
-				onAddPane={handleAddPane}
-				onAddBrowserPane={handleAddBrowserPane}
-				onOpenFile={handleOpenFile}
-				onUpdateTab={handleUpdateTab}
-				focusedPaneId={workspace.focusedPaneId}
-				onFocusPane={handleFocusPane}
-				onSwapPanes={handleSwapPanes}
-				onSplitPane={handleSplitPane}
-				onUpdateLayout={handleUpdateLayout}
-			/>
-		</div>
-	);
-});
 
 export function App() {
 	const [activeIndex, setActiveIndex] = useState(0);
@@ -822,16 +794,20 @@ export function App() {
 	const [gitPaneWidth, setGitPaneWidth] = useState(readStoredGitPaneWidth);
 	const topSettingsButtonRef = useRef<HTMLButtonElement>(null);
 	const railSettingsButtonRef = useRef<HTMLButtonElement>(null);
+	const topFileTreeButtonRef = useRef<HTMLButtonElement>(null);
+	const railFileTreeButtonRef = useRef<HTMLButtonElement>(null);
 	const settingsPanelRef = useRef<HTMLDivElement>(null);
+	const fileTreePanelRef = useRef<HTMLDivElement>(null);
 	const workspacePillbarRef = useRef<HTMLDivElement>(null);
 	const [settingsPanelPosition, setSettingsPanelPosition] = useState({ left: 8, top: 44, maxHeight: 520 });
+	const [fileTreePanelPosition, setFileTreePanelPosition] = useState({ left: 8, top: 52, maxHeight: 520 });
 	const [overviewOpen, setOverviewOpen] = useState(false);
 	const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
 	const [renamingWorkspaceId, setRenamingWorkspaceId] = useState<string | null>(null);
 	const [workspaceRenameDraft, setWorkspaceRenameDraft] = useState("");
-	const [mountedWorkspaceIds, setMountedWorkspaceIds] = useState<string[]>([]);
+	const [hotkeys, setHotkeys] = useState<Record<HotkeyActionId, string>>(readStoredHotkeys);
+	const [capturingHotkeyId, setCapturingHotkeyId] = useState<HotkeyActionId | null>(null);
 	const workspacesRef = useRef<WorkspaceModel[]>([]);
-	const persistWorkspacesTimerRef = useRef<number | null>(null);
 	const sessionManager = useSessionManager();
 
 	const currentTheme = themes[themeId];
@@ -939,10 +915,13 @@ export function App() {
 		async (paths: string[]) => {
 			if (typeof window === "undefined" || typeof window.mosaic === "undefined") return;
 			const uniquePaths = [...new Set(paths.map((value) => normalizeWorkspacePath(value)).filter(Boolean))];
-			const inspectedWorkspaces = await Promise.allSettled(uniquePaths.map((droppedPath) => window.mosaic.inspectWorkspace(droppedPath)));
-			for (const result of inspectedWorkspaces) {
-				if (result.status !== "fulfilled") continue;
-				openWorkspaceSelection(result.value);
+			for (const droppedPath of uniquePaths) {
+				try {
+					const inspected = await window.mosaic.inspectWorkspace(droppedPath);
+					openWorkspaceSelection(inspected);
+				} catch {
+					// Ignore non-directory drops.
+				}
 			}
 		},
 		[openWorkspaceSelection],
@@ -1134,7 +1113,7 @@ export function App() {
 
 	useEffect(() => {
 		if (typeof window === "undefined") return;
-		window.localStorage.setItem(STORAGE_KEYS.fileTreeWidth, String(clampNumber(fileTreeWidth, FILE_TREE_MIN_WIDTH, FILE_TREE_MAX_WIDTH)));
+		window.localStorage.setItem(STORAGE_KEYS.fileTreeWidth, String(fileTreeWidth));
 	}, [fileTreeWidth]);
 
 	useEffect(() => {
@@ -1144,22 +1123,17 @@ export function App() {
 
 	useEffect(() => {
 		if (typeof window === "undefined") return;
-		window.localStorage.setItem(STORAGE_KEYS.gitPaneWidth, String(clampNumber(gitPaneWidth, FILE_TREE_MIN_WIDTH, FILE_TREE_MAX_WIDTH)));
+		window.localStorage.setItem(STORAGE_KEYS.gitPaneWidth, String(gitPaneWidth));
 	}, [gitPaneWidth]);
 
 	useEffect(() => {
+		if (typeof window === "undefined") return;
+		window.localStorage.setItem(STORAGE_KEYS.hotkeys, JSON.stringify(hotkeys));
+	}, [hotkeys]);
+
+	useEffect(() => {
 		if (typeof window === "undefined" || isHydrating) return;
-		if (persistWorkspacesTimerRef.current) window.clearTimeout(persistWorkspacesTimerRef.current);
-		persistWorkspacesTimerRef.current = window.setTimeout(() => {
-			window.localStorage.setItem(STORAGE_KEYS.workspaces, JSON.stringify(serializeWorkspaceState(workspaces)));
-			persistWorkspacesTimerRef.current = null;
-		}, 300);
-		return () => {
-			if (persistWorkspacesTimerRef.current) {
-				window.clearTimeout(persistWorkspacesTimerRef.current);
-				persistWorkspacesTimerRef.current = null;
-			}
-		};
+		window.localStorage.setItem(STORAGE_KEYS.workspaces, JSON.stringify(serializeWorkspaceState(workspaces)));
 	}, [isHydrating, workspaces]);
 
 	useEffect(() => {
@@ -1168,10 +1142,10 @@ export function App() {
 
 	useEffect(() => {
 		if (typeof window === "undefined" || typeof window.mosaic?.updateTitleBarOverlay !== "function") return;
-		const titleBarBg = currentTheme.bgVoid;
+		const canvasSurface = getCanvasSurface(currentTheme);
 		window.mosaic.updateTitleBarOverlay({
-			backgroundColor: titleBarBg,
-			overlayColor: titleBarBg,
+			backgroundColor: canvasSurface,
+			overlayColor: canvasSurface,
 			symbolColor: currentTheme.kind === "light" ? "#3f3f46" : "#a1a1aa",
 		});
 	}, [currentTheme]);
@@ -1188,6 +1162,7 @@ export function App() {
 	const closeSettings = useCallback(() => {
 		setSettingsOpen(false);
 		setSettingsView("root");
+		setCapturingHotkeyId(null);
 	}, []);
 
 	const openCommandPalette = useCallback(() => {
@@ -1198,49 +1173,61 @@ export function App() {
 		setCommandPaletteOpen(false);
 	}, []);
 
+	useEffect(() => {
+		if (!capturingHotkeyId) return;
+		const handleCapture = (event: KeyboardEvent) => {
+			event.preventDefault();
+			event.stopPropagation();
+			if (event.key === "Escape") {
+				setCapturingHotkeyId(null);
+				return;
+			}
+			if (!["Control", "Shift", "Alt", "Meta"].includes(event.key)) {
+				setHotkeys((current) => ({
+					...current,
+					[capturingHotkeyId]: serializeHotkey(event),
+				}));
+				setCapturingHotkeyId(null);
+			}
+		};
+		window.addEventListener("keydown", handleCapture, true);
+		return () => window.removeEventListener("keydown", handleCapture, true);
+	}, [capturingHotkeyId]);
+
 	const closeFileTree = useCallback(() => {
 		setFileTreeOpen(false);
 	}, []);
 
-	const closeGitPane = useCallback(() => {
-		setGitPaneOpen(false);
-	}, []);
-
-	const handleFileTreeWidthChange = useCallback((nextWidth: number) => {
-		setFileTreeWidth(clampNumber(nextWidth, FILE_TREE_MIN_WIDTH, FILE_TREE_MAX_WIDTH));
-	}, []);
-
-	const handleGitPaneWidthChange = useCallback((nextWidth: number) => {
-		setGitPaneWidth(clampNumber(nextWidth, FILE_TREE_MIN_WIDTH, FILE_TREE_MAX_WIDTH));
-	}, []);
-
 	const updateSettingsPanelPosition = useCallback(() => {
+		if (typeof window === "undefined") return;
+		const maxHeight = Math.max(320, window.innerHeight - 24);
+		setSettingsPanelPosition((current) => (Math.abs(current.maxHeight - maxHeight) < 0.5 ? current : { ...current, maxHeight }));
+	}, []);
+
+	const updateFileTreePanelPosition = useCallback(() => {
 		if (typeof window === "undefined") return;
 
 		const margin = 8;
-		const gap = 6;
-		const anchorButton = tabOrientation === "horizontal" ? topSettingsButtonRef.current : railSettingsButtonRef.current;
+		const gap = 8;
+		const anchorButton = tabOrientation === "horizontal" ? topFileTreeButtonRef.current : railFileTreeButtonRef.current;
 		const buttonRect = anchorButton?.getBoundingClientRect();
-		const panelRect = settingsPanelRef.current?.getBoundingClientRect();
-		const panelWidth = panelRect?.width ?? 260;
-		const panelHeight = panelRect?.height ?? 380;
+		const panelRect = fileTreePanelRef.current?.getBoundingClientRect();
+		const panelWidth = panelRect?.width ?? 270;
+		const panelHeight = panelRect?.height ?? 520;
 
 		let left = buttonRect ? buttonRect.left : margin;
 		left = Math.min(Math.max(left, margin), Math.max(margin, window.innerWidth - panelWidth - margin));
 
-		let top = buttonRect ? buttonRect.bottom + gap : 44;
-		if (buttonRect) {
-			const fitsBelow = buttonRect.bottom + gap + panelHeight <= window.innerHeight - margin;
-			const aboveTop = buttonRect.top - gap - panelHeight;
-			if (!fitsBelow && aboveTop >= margin) {
-				top = aboveTop;
-			}
-		}
+		let top = buttonRect ? buttonRect.bottom + gap : 52;
 		top = Math.min(Math.max(top, margin), Math.max(margin, window.innerHeight - panelHeight - margin));
-
 		const maxHeight = Math.max(320, window.innerHeight - top - margin);
-		setSettingsPanelPosition((current) => {
-			if (Math.abs(current.left - left) < 0.5 && Math.abs(current.top - top) < 0.5 && Math.abs(current.maxHeight - maxHeight) < 0.5) {
+
+		setFileTreePanelPosition((current) => {
+			if (
+				Math.abs(current.left - left) < 0.5 &&
+				Math.abs(current.top - top) < 0.5 &&
+				Math.abs(current.maxHeight - maxHeight) < 0.5
+			) {
 				return current;
 			}
 			return { left, top, maxHeight };
@@ -1259,26 +1246,28 @@ export function App() {
 		};
 	}, [settingsOpen, settingsView, tabOrientation, workspaces.length, updateSettingsPanelPosition]);
 
+	useLayoutEffect(() => {
+		if (!fileTreeOpen) return;
+		updateFileTreePanelPosition();
+		const rafId = window.requestAnimationFrame(updateFileTreePanelPosition);
+		const handleResize = () => updateFileTreePanelPosition();
+		window.addEventListener("resize", handleResize);
+		return () => {
+			window.cancelAnimationFrame(rafId);
+			window.removeEventListener("resize", handleResize);
+		};
+	}, [fileTreeOpen, tabOrientation, activeIndex, updateFileTreePanelPosition]);
+
 	const activeWorkspace = workspaces[activeIndex];
 	const focusedPaneId = activeWorkspace ? activeWorkspace.focusedPaneId ?? findFirstPaneId(activeWorkspace.layout) : null;
 	const focusedPane = activeWorkspace && focusedPaneId ? findPaneById(activeWorkspace.layout, focusedPaneId) : null;
-
 
 	useEffect(() => {
 		if (!activeWorkspace) {
 			setOverviewOpen(false);
 			setFileTreeOpen(false);
-			setGitPaneOpen(false);
-			setMountedWorkspaceIds([]);
-			return;
 		}
-		setMountedWorkspaceIds((current) => (current.includes(activeWorkspace.id) ? current : [...current, activeWorkspace.id]));
 	}, [activeWorkspace]);
-
-	useEffect(() => {
-		const nextWorkspaceIds = new Set(workspaces.map((workspace) => workspace.id));
-		setMountedWorkspaceIds((current) => current.filter((workspaceId) => nextWorkspaceIds.has(workspaceId)));
-	}, [workspaces]);
 
 	useEffect(() => {
 		if (typeof window === "undefined" || tabOrientation !== "horizontal") return;
@@ -1294,15 +1283,7 @@ export function App() {
 		setSettingsView(view);
 	}, []);
 
-	const openOverview = useCallback(() => {
-		setOverviewOpen(true);
-	}, []);
-
-	const closeOverview = useCallback(() => {
-		setOverviewOpen(false);
-	}, []);
-
-	const toggleOverview = useCallback(() => {
+		const toggleOverview = useCallback(() => {
 		setOverviewOpen((current) => !current);
 	}, []);
 
@@ -1372,11 +1353,6 @@ export function App() {
 			} else {
 				let content: string;
 				try {
-					const info = await window.mosaic.getFileInfo(normalizedPath);
-					if (info.size > MAX_INLINE_TEXT_FILE_BYTES) {
-						window.alert(`Files larger than ${Math.round(MAX_INLINE_TEXT_FILE_BYTES / 1024)} KB are not opened inline yet.`);
-						return;
-					}
 					content = await window.mosaic.readFile(normalizedPath);
 				} catch (error) {
 					const message = error instanceof Error ? error.message : "Failed to read file.";
@@ -1442,6 +1418,24 @@ export function App() {
 			const shouldClose = window.confirm(`Discard unsaved changes in ${activeTab.title}?`);
 			if (!shouldClose) return;
 		}
+
+		if (focusedPane.tabs.length <= 1) {
+			if (isTerminalTab(activeTab)) {
+				sessionManager.closeSession(activeTab.id);
+			}
+			if (countPanes(activeWorkspace.layout) <= 1) {
+				removeWorkspace(activeWorkspace.id);
+				return;
+			}
+			const nextLayout = removePane(activeWorkspace.layout, focusedPaneId) ?? activeWorkspace.layout;
+			updateWorkspace(activeWorkspace.id, (workspace) => ({
+				...workspace,
+				layout: nextLayout,
+				focusedPaneId: findFirstPaneId(nextLayout),
+			}));
+			return;
+		}
+
 		if (isTerminalTab(activeTab)) {
 			sessionManager.closeSession(activeTab.id);
 		}
@@ -1451,7 +1445,7 @@ export function App() {
 			layout: nextLayout,
 			focusedPaneId,
 		}));
-	}, [activeWorkspace, focusedPane, focusedPaneId, sessionManager, updateWorkspace]);
+	}, [activeWorkspace, focusedPane, focusedPaneId, removeWorkspace, sessionManager, updateWorkspace]);
 
 	const stepFocusedTab = useCallback(
 		(delta: number) => {
@@ -1486,7 +1480,7 @@ export function App() {
 			const inspected = await window.mosaic.inspectWorkspace(workspace.path);
 			updateWorkspace(workspaceId, (current) => (isGitStatusEqual(current.git, inspected.git) ? current : { ...current, git: inspected.git }));
 		} catch {
-			// Keep previous git status on refresh failure.
+			// noop
 		}
 	}, [updateWorkspace]);
 
@@ -1553,7 +1547,7 @@ export function App() {
 				id: "pane:new-terminal",
 				label: "New terminal pane",
 				category: "Pane",
-				shortcut: "Ctrl Shift Enter",
+				shortcut: displayHotkey(hotkeys.newPane),
 				run: addPaneToActiveWorkspace,
 				disabled: !activeWorkspace,
 			},
@@ -1568,7 +1562,7 @@ export function App() {
 				id: "pane:split-vertical",
 				label: "Split focused pane vertically",
 				category: "Pane",
-				shortcut: "Ctrl Shift Alt %",
+				shortcut: displayHotkey(hotkeys.splitVertical),
 				run: () => splitFocusedPane("vertical"),
 				disabled: !canRunPaneAction,
 			},
@@ -1576,7 +1570,7 @@ export function App() {
 				id: "pane:split-horizontal",
 				label: "Split focused pane horizontally",
 				category: "Pane",
-				shortcut: "Ctrl Shift Alt \"",
+				shortcut: displayHotkey(hotkeys.splitHorizontal),
 				run: () => splitFocusedPane("horizontal"),
 				disabled: !canRunPaneAction,
 			},
@@ -1584,7 +1578,7 @@ export function App() {
 				id: "pane:close-focused",
 				label: "Close focused pane tab",
 				category: "Pane",
-				shortcut: "Ctrl Shift W",
+				shortcut: displayHotkey(hotkeys.closeTab),
 				run: closeFocusedTab,
 				disabled: !canRunPaneAction,
 			},
@@ -1606,24 +1600,20 @@ export function App() {
 				disabled: !activeWorkspace,
 			},
 			{
-				id: "workspace:git-pane",
-				label: "Open git pane",
-				category: "Workspace",
-				run: () => setGitPaneOpen(true),
-				disabled: !activeWorkspace,
-			},
-			{
-				id: "settings:tab-orientation",
-				label: `Use ${tabOrientation === "horizontal" ? "vertical" : "top"} workspace tabs`,
-				category: "Settings",
-				run: () => setTabOrientation((current) => (current === "horizontal" ? "vertical" : "horizontal")),
-			},
-			{
 				id: "settings:open",
 				label: "Open settings",
 				category: "Settings",
-				shortcut: "Ctrl ,",
+				shortcut: displayHotkey(hotkeys.openSettings),
 				run: () => openSettings(),
+			},
+			{
+				id: "palette:open",
+				label: "Toggle command palette",
+				category: "Navigation",
+				shortcut: displayHotkey(hotkeys.commandPalette),
+				run: () => {
+					setCommandPaletteOpen((current) => !current);
+				},
 			},
 		];
 	}, [
@@ -1635,13 +1625,14 @@ export function App() {
 		goTo,
 		openSettings,
 		splitFocusedPane,
-		tabOrientation,
+		hotkeys,
 		workspaces,
 	]);
 
 	useEffect(() => {
 		const handleKeydown = (event: KeyboardEvent) => {
-			if ((event.ctrlKey || event.metaKey) && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "k") {
+			const combo = serializeHotkey(event);
+			if (combo === hotkeys.commandPalette) {
 				event.preventDefault();
 				if (commandPaletteOpen) closeCommandPalette();
 				else openCommandPalette();
@@ -1672,12 +1663,6 @@ export function App() {
 				return;
 			}
 
-			if (event.key === "Escape" && gitPaneOpen) {
-				event.preventDefault();
-				closeGitPane();
-				return;
-			}
-
 			if (commandPaletteOpen) return;
 
 			const target = event.target as HTMLElement | null;
@@ -1687,37 +1672,43 @@ export function App() {
 				target instanceof HTMLSelectElement ||
 				target?.isContentEditable;
 
-			if (event.ctrlKey && event.shiftKey && !event.altKey && event.code === "KeyO") {
+			if (combo === hotkeys.openWorkspace) {
 				event.preventDefault();
 				void addWorkspace();
 				return;
 			}
 
-			if (event.ctrlKey && event.shiftKey && !event.altKey && event.code === "Enter") {
+			if (combo === hotkeys.newPane) {
 				event.preventDefault();
 				addPaneToActiveWorkspace();
 				return;
 			}
 
-			if (event.ctrlKey && event.shiftKey && !event.altKey && event.code === "KeyT") {
+			if (combo === hotkeys.newTab) {
 				event.preventDefault();
 				addTabToFocusedPane();
 				return;
 			}
 
-			if (event.ctrlKey && event.shiftKey && !event.altKey && event.code === "KeyW") {
+			if (combo === hotkeys.closeTab) {
 				event.preventDefault();
 				closeFocusedTab();
 				return;
 			}
 
-			if (event.ctrlKey && event.code === "Tab") {
+			if (combo === hotkeys.nextTab) {
 				event.preventDefault();
-				stepFocusedTab(event.shiftKey ? -1 : 1);
+				stepFocusedTab(1);
 				return;
 			}
 
-			if (event.ctrlKey && event.code === "Comma") {
+			if (combo === hotkeys.prevTab) {
+				event.preventDefault();
+				stepFocusedTab(-1);
+				return;
+			}
+
+			if (combo === hotkeys.openSettings) {
 				event.preventDefault();
 				openSettings();
 				return;
@@ -1729,22 +1720,27 @@ export function App() {
 				return;
 			}
 
-			if (event.ctrlKey && event.shiftKey && event.altKey && event.code === "Digit5") {
+			if (combo === hotkeys.splitVertical) {
 				event.preventDefault();
 				splitFocusedPane("vertical");
 				return;
 			}
 
-			if (event.ctrlKey && event.shiftKey && event.altKey && event.code === "Quote") {
+			if (combo === hotkeys.splitHorizontal) {
 				event.preventDefault();
 				splitFocusedPane("horizontal");
 				return;
 			}
 
-			if (event.ctrlKey && !event.altKey && !event.shiftKey && (event.key === "ArrowLeft" || event.key === "ArrowRight" || event.key === "ArrowUp" || event.key === "ArrowDown")) {
+			if (combo === hotkeys.focusLeft || combo === hotkeys.focusRight || combo === hotkeys.focusUp || combo === hotkeys.focusDown) {
 				event.preventDefault();
-				const dir = event.key.replace("Arrow", "").toLowerCase() as FocusDirection;
-				moveFocus(dir);
+				const map: Record<string, FocusDirection> = {
+					[hotkeys.focusLeft]: "left",
+					[hotkeys.focusRight]: "right",
+					[hotkeys.focusUp]: "up",
+					[hotkeys.focusDown]: "down",
+				};
+				moveFocus(map[combo]);
 				return;
 			}
 
@@ -1754,24 +1750,27 @@ export function App() {
 				return;
 			}
 
-			if (event.ctrlKey && event.altKey && !event.shiftKey && (event.key === "ArrowLeft" || event.key === "ArrowRight" || event.key === "ArrowUp" || event.key === "ArrowDown")) {
+			if (combo === hotkeys.resizeLeft || combo === hotkeys.resizeRight || combo === hotkeys.resizeUp || combo === hotkeys.resizeDown) {
 				event.preventDefault();
-				const dir = event.key.replace("Arrow", "").toLowerCase() as FocusDirection;
-				resizeFocusedPane(dir);
+				const map: Record<string, FocusDirection> = {
+					[hotkeys.resizeLeft]: "left",
+					[hotkeys.resizeRight]: "right",
+					[hotkeys.resizeUp]: "up",
+					[hotkeys.resizeDown]: "down",
+				};
+				resizeFocusedPane(map[combo]);
 				return;
 			}
 
-			if (event.altKey && event.shiftKey && !event.ctrlKey) {
-				if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
-					event.preventDefault();
-					goTo(activeIndex - 1);
-					return;
-				}
-				if (event.key === "ArrowRight" || event.key === "ArrowDown") {
-					event.preventDefault();
-					goTo(activeIndex + 1);
-					return;
-				}
+			if (combo === hotkeys.previousWorkspace) {
+				event.preventDefault();
+				goTo(activeIndex - 1);
+				return;
+			}
+			if (combo === hotkeys.nextWorkspace) {
+				event.preventDefault();
+				goTo(activeIndex + 1);
+				return;
 			}
 
 			if (isEditableTarget) return;
@@ -1797,11 +1796,9 @@ export function App() {
 		closeCommandPalette,
 		closeFileTree,
 		closeFocusedTab,
-		closeGitPane,
 		closeSettings,
 		commandPaletteOpen,
 		fileTreeOpen,
-		gitPaneOpen,
 		goTo,
 		moveFocus,
 		moveFocusedColumn,
@@ -1814,6 +1811,7 @@ export function App() {
 		stepFocusedTab,
 		tabOrientation,
 		toggleOverview,
+		hotkeys,
 	]);
 
 	const activeWorkspaceAccent = activeWorkspace ? getWorkspaceAccent(activeIndex, activeWorkspace) : currentTheme.accents.product;
@@ -1865,6 +1863,7 @@ export function App() {
 		</Reorder.Group>
 	);
 
+	const fileTreePanel = null;
 
 	const settingsPanel = settingsOpen && typeof document !== "undefined"
 		? createPortal(
@@ -1880,11 +1879,9 @@ export function App() {
 				/>
 				<div
 					ref={settingsPanelRef}
-					className={`settings-panel ${tabOrientation === "vertical" ? "rail" : "topbar"}`}
+					className="settings-panel centered"
 					style={{
-						left: `${settingsPanelPosition.left}px`,
-						top: `${settingsPanelPosition.top}px`,
-						maxHeight: `${settingsPanelPosition.maxHeight}px`,
+						maxHeight: `${Math.max(320, settingsPanelPosition.maxHeight)}px`,
 					}}
 					role="dialog"
 					aria-label="Settings"
@@ -1898,17 +1895,6 @@ export function App() {
 					{settingsView === "root" ? (
 						<>
 							<div className="settings-panel-header">Settings</div>
-							<button
-								type="button"
-								className="settings-item"
-								onClick={() => {
-									setTabOrientation((current) => (current === "horizontal" ? "vertical" : "horizontal"));
-									closeSettings();
-								}}
-							>
-								<span className="settings-item-icon">⊟</span>
-								<span className="settings-item-copy">{tabOrientation === "horizontal" ? "Vertical Tabs" : "Top Tabs"}</span>
-							</button>
 							<button type="button" className="settings-item" onClick={() => setSettingsView("skins")}>
 								<span className="settings-item-icon">◑</span>
 								<span className="settings-item-copy">Skins</span>
@@ -1950,13 +1936,30 @@ export function App() {
 						<div className="settings-section">
 							<div className="settings-item-label">Shortcuts</div>
 							<div className="shortcut-list">
-								{SHORTCUTS.map((shortcut) => (
-									<div key={shortcut.action} className="shortcut-item">
-										<span className="shortcut-action">{shortcut.action}</span>
-										<kbd className="shortcut-keys">{shortcut.keys}</kbd>
+								{HOTKEY_ORDER.map((id) => (
+									<div key={id} className="shortcut-item">
+										<span className="shortcut-action">{HOTKEY_LABELS[id]}</span>
+										<button
+											type="button"
+											className={`shortcut-keys ${capturingHotkeyId === id ? "capturing" : ""}`}
+											onClick={() => setCapturingHotkeyId(id)}
+										>
+											{capturingHotkeyId === id ? "Press keys…" : displayHotkey(hotkeys[id])}
+										</button>
 									</div>
 								))}
 							</div>
+							<button
+								type="button"
+								className="settings-item"
+								onClick={() => {
+									setHotkeys(HOTKEY_DEFAULTS);
+									setCapturingHotkeyId(null);
+								}}
+							>
+								<span className="settings-item-icon">↺</span>
+								<span className="settings-item-copy">Reset to defaults</span>
+							</button>
 						</div>
 					) : null}
 				</div>
@@ -1971,20 +1974,16 @@ export function App() {
 				<header className="topbar titlebar-drag tw-select-none">
 					<div className="topbar-component-row">
 						<div className="topbar-side topbar-side-leading">
-							<div className="topbar-leading-controls">
-								<button
-									type="button"
-									className={`icon-button file-tree-toggle ${fileTreeOpen ? "active" : ""}`}
-									onClick={toggleFileTree}
-									disabled={!hasActiveWorkspace}
-									aria-label={fileTreeOpen ? "Hide file tree" : "Show file tree"}
-								>
-									<FileTreeToggleIcon />
-								</button>
-								<button type="button" className="icon-button notifications-toggle" aria-label="Notifications">
-									<NotificationBellIcon />
-								</button>
-							</div>
+							<button
+								ref={topFileTreeButtonRef}
+								type="button"
+								className={`icon-button file-tree-toggle ${fileTreeOpen ? "active" : ""}`}
+								onClick={toggleFileTree}
+								disabled={!hasActiveWorkspace}
+								aria-label={fileTreeOpen ? "Hide file tree" : "Show file tree"}
+							>
+								<FileTreeToggleIcon />
+							</button>
 						</div>
 						<div className="workspace-switcher-shell">
 							<div className="workspace-switcher">
@@ -2018,7 +2017,7 @@ export function App() {
 									}}
 									aria-label="Open settings"
 								>
-									<SettingsIcon />
+									⚙
 								</button>
 							</div>
 						</div>
@@ -2033,6 +2032,7 @@ export function App() {
 						<aside className="workspace-rail tw-flex tw-min-h-0 tw-flex-col" onDragOver={handleWorkspaceDropDragOver} onDrop={handleWorkspaceDrop}>
 							<div className="workspace-rail-header">
 								<button
+									ref={railFileTreeButtonRef}
 									type="button"
 									className={`icon-button file-tree-toggle ${fileTreeOpen ? "active" : ""}`}
 									onClick={toggleFileTree}
@@ -2040,9 +2040,6 @@ export function App() {
 									aria-label={fileTreeOpen ? "Hide file tree" : "Show file tree"}
 								>
 									<FileTreeToggleIcon />
-								</button>
-								<button type="button" className="icon-button notifications-toggle" aria-label="Notifications">
-									<NotificationBellIcon />
 								</button>
 								<button
 									type="button"
@@ -2067,7 +2064,7 @@ export function App() {
 										}}
 										aria-label="Open settings"
 									>
-										<SettingsIcon />
+										⚙
 									</button>
 								</div>
 								<button type="button" className="icon-button workspace-tab-add" onClick={addWorkspace} aria-label="Open directory">
@@ -2079,51 +2076,89 @@ export function App() {
 						</aside>
 					) : null}
 					<div className="workspace-stage tw-relative tw-flex-1 tw-overflow-hidden">
-						{workspaces.length === 0 ? (
-							<div className="empty-state" onDragOver={handleWorkspaceDropDragOver} onDrop={handleWorkspaceDrop}>
-								<div className="empty-state-hero">
-									<h1 className="empty-state-brand">Mosaic</h1>
-									<p className="empty-state-tagline">Open a directory to begin.</p>
-									<button type="button" className="empty-state-cta" onClick={addWorkspace}>
-										Open Directory
-									</button>
-								</div>
-							</div>
-						) : (
-							workspaces.map((workspace, index) => {
-								const isVisible = workspace.id === activeWorkspace?.id;
-								if (!isVisible && !mountedWorkspaceIds.includes(workspace.id)) return null;
-								const workspaceAccent = getWorkspaceAccent(index, workspace);
-								return (
-									<WorkspacePanel
-										key={workspace.id}
-										workspace={workspace}
-										accent={workspaceAccent}
+						<AnimatePresence initial={false} mode="wait">
+							{workspaces.length === 0 ? (
+								<motion.div
+									key="empty"
+									className="empty-state"
+									onDragOver={handleWorkspaceDropDragOver}
+									onDrop={handleWorkspaceDrop}
+									initial={{ opacity: 0, scale: 0.995, y: 4 }}
+									animate={{ opacity: 1, scale: 1, y: 0 }}
+									exit={{ opacity: 0, scale: 0.995, y: -2 }}
+									transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
+								>
+									<div className="empty-state-hero">
+										<h1 className="empty-state-brand">Mosaic</h1>
+										<p className="empty-state-tagline">Open a directory to begin.</p>
+										<button type="button" className="empty-state-cta" onClick={addWorkspace}>
+											Open Directory
+										</button>
+									</div>
+								</motion.div>
+							) : activeWorkspace ? (
+								<motion.div
+									key={activeWorkspace.id}
+									className="workspace-panel"
+									initial={{ opacity: 0, scale: 0.995, y: 2 }}
+									animate={{ opacity: 1, scale: 1, y: 0 }}
+									exit={{ opacity: 0, scale: 0.995, y: -1 }}
+									transition={{ duration: 0.19, ease: [0.22, 1, 0.36, 1] }}
+								>
+									<WorkspaceView
+										workspace={activeWorkspace}
+										accent={activeWorkspaceAccent}
 										theme={currentTheme}
-										visible={isVisible}
-										overviewOpen={isVisible && overviewOpen}
-										fileTreeOpen={isVisible && fileTreeOpen}
+										focusMode="center"
+										fileTreeOpen={fileTreeOpen}
 										fileTreeWidth={fileTreeWidth}
-										onFileTreeWidthChange={handleFileTreeWidthChange}
-										gitPaneOpen={isVisible && gitPaneOpen}
+										onFileTreeWidthChange={setFileTreeWidth}
+										gitPaneOpen={gitPaneOpen}
 										gitPaneWidth={gitPaneWidth}
-										onGitPaneWidthChange={handleGitPaneWidthChange}
-										onRefreshWorkspaceGit={refreshWorkspaceGit}
-										onExitOverview={closeOverview}
-										onOpenOverview={openOverview}
-										onOpenFileFromTree={openFileFromTree}
-										onUpdateWorkspaceTab={updateWorkspaceTab}
-										onFocusWorkspacePane={focusPane}
-										onUpdateWorkspace={updateWorkspace}
-									onRemoveWorkspace={removeWorkspace}
+										onGitPaneWidthChange={setGitPaneWidth}
+										onRefreshWorkspaceGit={() => refreshWorkspaceGit(activeWorkspace.id)}
+										overviewOpen={overviewOpen}
+										onExitOverview={() => setOverviewOpen(false)}
+										onOpenOverview={() => setOverviewOpen(true)}
+										onAddPane={addPaneToActiveWorkspace}
+										onAddBrowserPane={addBrowserPaneToActiveWorkspace}
+										onOpenFile={(filePath) => void openFileFromTree(activeWorkspace.id, filePath)}
+										onUpdateTab={(paneId, tabId, updater) => updateWorkspaceTab(activeWorkspace.id, paneId, tabId, updater)}
+										focusedPaneId={activeWorkspace.focusedPaneId}
+										onFocusPane={(paneId) => focusPane(activeWorkspace.id, paneId)}
+										onSwapPanes={(sourcePaneId, targetPaneId) =>
+											updateWorkspace(activeWorkspace.id, (workspace) => ({
+												...workspace,
+												layout: swapPanes(workspace.layout, sourcePaneId, targetPaneId),
+												focusedPaneId: sourcePaneId,
+											}))
+										}
+										onSplitPane={(paneId, direction) =>
+											updateWorkspace(activeWorkspace.id, (workspace) => ({
+												...workspace,
+												layout: splitNode(workspace.layout, paneId, direction, workspace.path),
+												focusedPaneId: paneId,
+											}))
+										}
+										onUpdateLayout={(layout) =>
+											updateWorkspace(activeWorkspace.id, (workspace) => ({
+												...workspace,
+												layout,
+												focusedPaneId:
+													workspace.focusedPaneId && findPaneById(layout, workspace.focusedPaneId)
+														? workspace.focusedPaneId
+														: findFirstPaneId(layout),
+											}))
+										}
 									/>
-								);
-							})
-						)}
+								</motion.div>
+							) : null}
+						</AnimatePresence>
 					</div>
 				</div>
 			</div>
 
+			{fileTreePanel}
 			{settingsPanel}
 			<CommandPalette open={commandPaletteOpen} actions={commandActions} onClose={closeCommandPalette} />
 		</div>

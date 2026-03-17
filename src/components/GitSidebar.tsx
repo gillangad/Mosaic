@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { WorkspaceGitStatus } from "../core/models";
 
 interface SidebarGitFileEntry {
@@ -61,6 +61,7 @@ export function GitSidebar({ workspacePath, git, onRefresh }: GitSidebarProps) {
 	const [busyAction, setBusyAction] = useState<string | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	const [refreshing, setRefreshing] = useState(false);
+	const commitInputRef = useRef<HTMLInputElement | null>(null);
 
 	const refreshWorkspaceBadge = useCallback(() => {
 		if (!onRefresh) return;
@@ -144,8 +145,54 @@ export function GitSidebar({ workspacePath, git, onRefresh }: GitSidebarProps) {
 	const activeBranch = useMemo(() => branches.find((branch) => branch.current)?.name ?? status.branch ?? "detached", [branches, status.branch]);
 	const hasRepo = status.isRepo;
 
+	const handleStageAll = useCallback(() => {
+		void runAction("stage-all", async () => {
+			await window.mosaic.gitStage(workspacePath, ".");
+			await loadStatus(true);
+		});
+	}, [loadStatus, runAction, workspacePath]);
+
+	const handleUnstageAll = useCallback(() => {
+		void runAction("unstage-all", async () => {
+			await window.mosaic.gitUnstage(workspacePath, ".");
+			await loadStatus(true);
+		});
+	}, [loadStatus, runAction, workspacePath]);
+
+	const handlePush = useCallback(() => {
+		void runAction("push", async () => {
+			await window.mosaic.gitPush(workspacePath);
+			await loadSidebarData();
+		});
+	}, [loadSidebarData, runAction, workspacePath]);
+
 	return (
-		<div className="git-pane-surface workspace-git-surface tw-flex tw-h-full tw-min-h-0 tw-flex-col">
+		<div
+			className="git-pane-surface workspace-git-surface tw-flex tw-h-full tw-min-h-0 tw-flex-col"
+			tabIndex={0}
+			onKeyDown={(event) => {
+				if (!hasRepo) return;
+				const target = event.target as HTMLElement | null;
+				const isEditableTarget =
+					target instanceof HTMLInputElement ||
+					target instanceof HTMLTextAreaElement ||
+					target instanceof HTMLSelectElement ||
+					target?.isContentEditable;
+				if (isEditableTarget) return;
+				if (event.key.toLowerCase() === "s") {
+					event.preventDefault();
+					handleStageAll();
+				}
+				if (event.key.toLowerCase() === "c") {
+					event.preventDefault();
+					commitInputRef.current?.focus();
+				}
+				if (event.key.toLowerCase() === "p") {
+					event.preventDefault();
+					handlePush();
+				}
+			}}
+		>
 			<div className="file-tree-toolbar tw-flex tw-items-center tw-gap-2">
 				<div className="file-tree-search tw-flex tw-min-w-0 tw-flex-1 tw-items-center">
 					<span className="git-pane-title">Git</span>
@@ -213,24 +260,24 @@ export function GitSidebar({ workspacePath, git, onRefresh }: GitSidebarProps) {
 								>
 									Pull
 								</button>
-								<button
-									type="button"
-									className="git-pane-action"
-									onClick={() => {
-										void runAction("push", async () => {
-											await window.mosaic.gitPush(workspacePath);
-											await loadSidebarData();
-										});
-									}}
-									disabled={busyAction !== null}
-								>
+								<button type="button" className="git-pane-action" onClick={handlePush} disabled={busyAction !== null}>
 									Push
 								</button>
 							</div>
 						</div>
 
 						<div className="git-pane-section">
-							<div className="git-pane-label">Changed files</div>
+							<div className="git-pane-row git-pane-row-between">
+								<div className="git-pane-label">Changed files</div>
+								<div className="git-pane-tools">
+									<button type="button" className="git-pane-action" onClick={handleStageAll} disabled={busyAction !== null || status.files.length === 0}>
+										Stage all
+									</button>
+									<button type="button" className="git-pane-action" onClick={handleUnstageAll} disabled={busyAction !== null || status.files.length === 0}>
+										Unstage all
+									</button>
+								</div>
+							</div>
 							{status.files.length === 0 ? <div className="git-pane-value">Working tree clean.</div> : null}
 							<div className="git-file-list">
 								{status.files.map((file) => {
@@ -285,6 +332,7 @@ export function GitSidebar({ workspacePath, git, onRefresh }: GitSidebarProps) {
 							<div className="git-pane-label">Commit</div>
 							<div className="git-pane-commit-row">
 								<input
+									ref={commitInputRef}
 									type="text"
 									value={commitMessage}
 									onChange={(event) => setCommitMessage(event.target.value)}
@@ -397,6 +445,7 @@ export function GitSidebar({ workspacePath, git, onRefresh }: GitSidebarProps) {
 					</>
 				)}
 
+				{hasRepo ? <div className="git-pane-shortcuts">Shortcuts: S stage all · C focus commit · P push</div> : null}
 				{error ? <div className="git-pane-error">{error}</div> : null}
 			</div>
 		</div>
