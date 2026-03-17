@@ -202,7 +202,7 @@ select {
 
 .topbar-component-row {
 	display: grid;
-	grid-template-columns: 44px minmax(0, 1fr) 44px;
+	grid-template-columns: auto minmax(0, 1fr) auto;
 	align-items: center;
 	gap: 12px;
 	width: 100%;
@@ -215,6 +215,7 @@ select {
 	align-items: center;
 	justify-content: center;
 	min-width: 0;
+	gap: 8px;
 }
 
 .topbar-side-trailing {
@@ -353,8 +354,8 @@ select {
 .workspace-tab.renaming {
 	color: var(--text-primary);
 	background: #0B0B0E;
-	border-color: var(--canvas-border);
-	box-shadow: none;
+	border-color: var(--border-glow);
+	box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--border-glow) 55%, transparent);
 }
 
 .workspace-tab:hover {
@@ -2020,13 +2021,13 @@ select {
 .layout-vertical > .layout-branch.vertical-first {
 	flex: 0 0 var(--branch-size);
 	min-width: 0;
-	overflow: hidden;
+	overflow: visible;
 }
 
 .layout-vertical > .layout-branch.vertical-second {
 	flex: 0 0 var(--branch-size);
 	min-width: 0;
-	overflow: hidden;
+	overflow: visible;
 }
 
 .layout-horizontal > .layout-branch {
@@ -2034,7 +2035,7 @@ select {
 	width: 100%;
 	min-width: 0;
 	min-height: 0;
-	overflow: hidden;
+	overflow: visible;
 }
 
 .layout-horizontal,
@@ -2068,23 +2069,23 @@ select {
 }
 
 .layout-resizer-vertical {
-	width: 8px;
+	width: 14px;
 	display: flex;
 	align-items: stretch;
 	justify-content: space-between;
-	gap: 0;
+	gap: 4px;
 }
 
 .layout-edge-handle {
 	border: none;
 	padding: 0;
-	width: 4px;
+	width: 5px;
 	cursor: col-resize;
 	background: transparent;
 }
 
 .layout-resizer-horizontal {
-	height: 8px;
+	height: 10px;
 	width: 100%;
 	cursor: row-resize;
 	border: none;

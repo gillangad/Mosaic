@@ -2016,7 +2016,7 @@ export function App() {
 			{tabOrientation === "horizontal" ? (
 				<header className="topbar titlebar-drag tw-select-none">
 					<div className="topbar-component-row">
-						<div className="topbar-side topbar-side-leading">
+							<div className="topbar-side topbar-side-leading">
 							<button
 								ref={topFileTreeButtonRef}
 								type="button"
@@ -2026,6 +2026,21 @@ export function App() {
 								aria-label={fileTreeOpen ? "Hide file tree" : "Show file tree"}
 							>
 								<FileTreeToggleIcon />
+							</button>
+							<button
+								ref={topSettingsButtonRef}
+								type="button"
+								className={`icon-button ${settingsOpen ? "active" : ""}`}
+								onClick={() => {
+									if (settingsOpen) {
+										closeSettings();
+										return;
+									}
+									openSettings();
+								}}
+								aria-label="Open settings"
+							>
+								<SettingsIcon />
 							</button>
 						</div>
 						<div className="workspace-switcher-shell">
@@ -2037,32 +2052,15 @@ export function App() {
 							</div>
 						</div>
 						<div className="topbar-side topbar-side-trailing">
-							<div className="settings-anchor settings-anchor-trailing topbar-trailing-settings">
-								<button
-									type="button"
-									className={`icon-button git-pane-toggle ${gitPaneOpen ? "active" : ""}`}
-									onClick={toggleGitPane}
-									disabled={!hasActiveWorkspace}
-									aria-label={gitPaneOpen ? "Hide git pane" : "Show git pane"}
-								>
-									<GitPaneToggleIcon />
-								</button>
-								<button
-									ref={topSettingsButtonRef}
-									type="button"
-									className={`icon-button ${settingsOpen ? "active" : ""}`}
-									onClick={() => {
-										if (settingsOpen) {
-											closeSettings();
-											return;
-										}
-										openSettings();
-									}}
-									aria-label="Open settings"
-								>
-									<SettingsIcon />
-								</button>
-							</div>
+							<button
+								type="button"
+								className={`icon-button git-pane-toggle ${gitPaneOpen ? "active" : ""}`}
+								onClick={toggleGitPane}
+								disabled={!hasActiveWorkspace}
+								aria-label={gitPaneOpen ? "Hide git pane" : "Show git pane"}
+							>
+								<GitPaneToggleIcon />
+							</button>
 						</div>
 					</div>
 				</header>
